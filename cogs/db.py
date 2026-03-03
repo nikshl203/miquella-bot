@@ -33,12 +33,13 @@ class Repo:
 
     async def connect(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.conn = await aiosqlite.connect(DB_PATH)
+        self.conn = await aiosqlite.connect(DB_PATH, timeout=30)
         # Use Row for name-based access, but we still return dicts outward.
         self.conn.row_factory = aiosqlite.Row
 
         await self.conn.execute("PRAGMA journal_mode=WAL;")
         await self.conn.execute("PRAGMA foreign_keys=ON;")
+        await self.conn.execute("PRAGMA busy_timeout=5000;")
         await self._create_tables()
         await self._migrate_schema()
         await self.conn.commit()
