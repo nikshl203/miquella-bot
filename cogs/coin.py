@@ -1,7 +1,9 @@
+\
 # cogs/coin.py
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import random
 import time
@@ -44,6 +46,8 @@ FEE_RATE = 0.05  # 5% (ceil), min 1 if profit > 0
 
 SIDE_NAME = {"heads": "Орёл", "tails": "Решка"}
 
+log = logging.getLogger("miquella.coin")
+
 
 def msk_day_key() -> str:
     # MSK = UTC+3, no DST
@@ -66,7 +70,7 @@ def lore_no_runes() -> str:
     return random.choice(
         [
             "Пустота заглянула в твой кошель… и не услышала звона.",
-            "Рун не хватает.\nМонета улыбается: «Пока не сегодня».",
+            "Рун не хватает. Монета улыбается: «Пока не сегодня».",
             "Твои руны слишком тихие. Монета не слушает шёпот бедняка.",
             "Ты тянешься к ставке — а пальцы скользят по пустоте.",
             "Сейчас ты беднее, чем твоя надежда.",
@@ -80,7 +84,7 @@ def lore_too_early() -> str:
             "Тебе ещё рано. Монета не смотрит на тех, кто не дорос до риска.",
             "Пока нет. Пустота держит эту дверь закрытой.",
             "Ты чувствуешь холод — это уровень не пускает дальше.",
-            "Монета молчит.\nТвой уровень ещё не звучит достаточно громко.",
+            "Монета молчит. Твой уровень ещё не звучит достаточно громко.",
         ]
     )
 
@@ -100,14 +104,14 @@ def pre_spin_phrase() -> str:
         [
             "Держи ладонь ровно. Падение монеты всегда неровное.",
             "Сейчас ты почувствуешь надежду. Она будет недолгой.",
-            "Монета уже решила.\nНо ты всё равно сделаешь вид, что выбираешь.",
+            "Монета уже решила. Но ты всё равно сделаешь вид, что выбираешь.",
             "Твой выбор важен ровно настолько, насколько Пустота позволяет.",
             "Сделай вдох. На выдохе обычно проигрывают.",
             "Не смотри слишком пристально — удача любит чужие глаза.",
             "Шанс тоньше волоса. Но именно им тебя и режут.",
             "Пусть руны не дрожат. Это дрожишь ты.",
             "Стук монеты громче твоих обещаний.",
-            "Пустота улыбается.\nНе тебе.",
+            "Пустота улыбается. Не тебе.",
         ]
     )
 
@@ -144,10 +148,17 @@ class CoinCog(commands.Cog):
         for k, cap in DAILY_PROFIT_CAP.items():
             have = 0
             if callable(dp_get):
-                try:
-                    have = int(await dp_get(user_id, day, f"coin:{k}"))
-                except Exception:
-                    have = 0
+                # Retry a few times in case SQLite is temporarily busy (WAL / parallel queries)
+                for attempt in range(3):
+                    try:
+                        have = int(await dp_get(user_id, day, f"coin:{k}"))
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            log.warning("dp_get failed user=%s day=%s key=%s: %r", user_id, day, f"coin:{k}", e)
+                            have = 0
+                        else:
+                            await asyncio.sleep(0.15 * (attempt + 1))
             out[k] = (have, cap)
         return out
 
@@ -162,7 +173,7 @@ class CoinCog(commands.Cog):
             if diff.key == "cursed":
                 return False, lore_cursed_cd()
             left = max(1, (until - now) // 60)
-            return False, f"Пустота просит паузу.\nВернись через ~{left} мин."
+            return False, f"Пустота просит паузу. Вернись через ~{left} мин."
 
         cap = DAILY_PROFIT_CAP.get(diff.key)
         if cap is not None and not self.is_admin(user_id):
@@ -205,21 +216,14 @@ class CoinCog(commands.Cog):
             return
 
         embed = discord.Embed(
-            title=f" Монетка — {'ПОБЕДА' if win else 'ПОРАЖЕНИЕ'}",
+            title=f"🪙 Монетка — {'ПОБЕДА' if win else 'ПОРАЖЕНИЕ'}",
             description=f"Игрок: {interaction.user.mention}",
         )
-        embed.add_field(
-            name="Сложность",
-            value=f"{diff.title} ({int(diff.win_chance*100)}%)",
-            inline=True,
-        )
+        embed.add_field(name="Сложность", value=f"{diff.title} ({int(diff.win_chance*100)}%)", inline=True)
         embed.add_field(name="Сторона", value=SIDE_NAME[side], inline=True)
         embed.add_field(name="Выпало", value=SIDE_NAME[landed], inline=True)
-        embed.add_field(
-            name="Ставка",
-            value=str(bet if diff.key != "cursed" else 0),
-            inline=True,
-        )
+        embed.add_field(name="Ставка", value=str(bet if diff.key != "cursed" else 0), inline=True)
+
         if diff.key == "cursed":
             embed.add_field(name="Итог", value=f"+{reward}", inline=True)
         else:
@@ -242,7 +246,6 @@ class CoinCog(commands.Cog):
 
         prog = await self.daily_progress(interaction.user.id)
         view = DifficultyView(self, interaction.user.id, prog)
-
         try:
             await interaction.followup.send(
                 content="**Выбор судьбы открыт.**",
@@ -253,13 +256,7 @@ class CoinCog(commands.Cog):
         except discord.NotFound:
             return
 
-    async def go_spin_and_resolve(
-        self,
-        interaction: discord.Interaction,
-        diff: Diff,
-        bet: int,
-        side: str,
-    ) -> None:
+    async def go_spin_and_resolve(self, interaction: discord.Interaction, diff: Diff, bet: int, side: str) -> None:
         user_id = interaction.user.id
 
         # charge bet (except cursed)
@@ -315,7 +312,7 @@ class CoinCog(commands.Cog):
         await asyncio.sleep(2)
 
         # Final embed
-        result_embed = discord.Embed(title=f" Монетка — {'ПОБЕДА' if win else 'ПОРАЖЕНИЕ'}")
+        result_embed = discord.Embed(title=f"🪙 Монетка — {'ПОБЕДА' if win else 'ПОРАЖЕНИЕ'}")
         result_embed.add_field(name="Сложность", value=f"{diff.title} ({int(diff.win_chance*100)}%)", inline=True)
         result_embed.add_field(name="Ставка", value=str(bet if diff.key != "cursed" else 0), inline=True)
         result_embed.add_field(name="Твоя сторона", value=SIDE_NAME[side], inline=True)
@@ -334,28 +331,20 @@ class CoinCog(commands.Cog):
             profit = int(reward) if win else 0
             fee = fee_from_profit(profit) if win else 0
             net = max(0, profit - fee)
-
             result_embed.add_field(name="Прибыль", value=f"+{profit}", inline=True)
             result_embed.add_field(name="Дань Бездне", value=f"-{fee}", inline=True)
             result_embed.add_field(name="Чистая прибыль", value=f"+{net}", inline=True)
 
             cap = DAILY_PROFIT_CAP.get(diff.key)
             if cap is not None:
-                have_before = 0
+                have = 0
                 dp_get = getattr(self.repo, "dp_get", None)
                 if callable(dp_get):
                     try:
-                        have_before = int(await dp_get(user_id, msk_day_key(), f"coin:{diff.key}"))
+                        have = int(await dp_get(user_id, msk_day_key(), f"coin:{diff.key}"))
                     except Exception:
-                        have_before = 0
-
-                # ✅ показываем УЖЕ обновлённый лимит (не меняя механику)
-                have_after = have_before + int(net)
-                result_embed.add_field(
-                    name="Лимит прибыли (сегодня)",
-                    value=f"{have_after}/{cap}",
-                    inline=True,
-                )
+                        have = 0
+                result_embed.add_field(name="Сегодня (печать)", value=f"{have}/{cap}", inline=True)
 
         # Apply rewards
         if win and reward > 0:
@@ -365,16 +354,22 @@ class CoinCog(commands.Cog):
                 profit = int(reward)
                 fee = fee_from_profit(profit)
                 net = max(0, profit - fee)
-
                 # bet is returned + net profit
                 await self.repo.add_runes(user_id, int(bet) + int(net))
-
                 dp_add = getattr(self.repo, "dp_add", None)
                 if callable(dp_add) and net > 0:
-                    try:
-                        await dp_add(user_id, msk_day_key(), f"coin:{diff.key}", int(net))
-                    except Exception:
-                        pass
+                    day = msk_day_key()
+                    key = f"coin:{diff.key}"
+                    # Retry a few times; previously failures were silently swallowed.
+                    for attempt in range(3):
+                        try:
+                            await dp_add(user_id, day, key, int(net))
+                            break
+                        except Exception as e:
+                            if attempt == 2:
+                                log.warning("dp_add failed user=%s day=%s key=%s net=%s: %r", user_id, day, key, int(net), e)
+                            else:
+                                await asyncio.sleep(0.2 * (attempt + 1))
 
         # Send final
         try:
@@ -409,10 +404,9 @@ class CoinCog(commands.Cog):
                 continue
 
             embed = discord.Embed(
-                title=" Алтарь Монетки",
+                title="🪙 Алтарь Монетки",
                 description=(
-                    "Нажми **Играть**.\n"
-                    "Дальше кнопки будут работать только для того, кто рискнул.\n"
+                    "Нажми **Играть**. Дальше кнопки будут работать только для того, кто рискнул.\n"
                     "Монета крутится — как и твоя удача."
                 ),
             )
@@ -463,16 +457,18 @@ class DifficultyView(discord.ui.View):
         for d in DIFFS:
             label = f"{d.title} ({int(d.win_chance*100)}%) • ур.{d.unlock_level}+"
             self.add_item(DiffButton(d, label))
+
         self.add_item(CancelButton())
 
     def make_embed(self) -> discord.Embed:
         e = discord.Embed(
             title="Выбор сложности",
-            description="Выбери сложность.\n(Все видны всегда, но Пустота пускает не всех.)",
+            description="Выбери сложность. (Все видны всегда, но Пустота пускает не всех.)",
         )
+
         e.add_field(
             name="Проклятая",
-            value="Бесплатная. Выигрыш = дневной доход по уровню.\nКД: 24 часа.\nПри поражении — статус.",
+            value="Бесплатная. Выигрыш = дневной доход по уровню.\nКД: 24 часа. При поражении — статус.",
             inline=False,
         )
 
@@ -481,9 +477,9 @@ class DifficultyView(discord.ui.View):
         hard_have, hard_cap = self.progress.get("hard", (0, DAILY_PROFIT_CAP["hard"]))
 
         e.add_field(
-            name="Лимит прибыли (сегодня, по МСК)",
+            name="Печать Пустоты — твой прогресс (по МСК)",
             value=(
-                "Лёгкая: **{}/{}** | Средняя: **{}/{}** | Сложная: **{}/{}**\n"
+                "Лёгкая: **{}/{}**  |  Средняя: **{}/{}**  |  Сложная: **{}/{}**\n"
                 "Дань Бездне: **5%** с прибыли (округление вверх)."
             ).format(easy_have, easy_cap, mid_have, mid_cap, hard_have, hard_cap),
             inline=False,
@@ -528,13 +524,14 @@ class BetView(discord.ui.View):
         for b in diff.bets:
             win_amt = round_up_int(b * diff.mult)
             self.add_item(BetButton(b, win_amt))
+
         self.add_item(BackButton())
         self.add_item(CancelButton())
 
     def make_embed(self) -> discord.Embed:
         return discord.Embed(
             title=f"Ставка: {self.diff.title} ({int(self.diff.win_chance*100)}%)",
-            description="Выбери ставку.\nРядом — сколько получишь при победе (до дани).",
+            description="Выбери ставку. Рядом — сколько получишь при победе (до дани).",
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -555,6 +552,7 @@ class BetButton(discord.ui.Button):
         if int(u.get("runes", 0)) < self.bet and not view.cog.is_admin(interaction.user.id):
             await interaction.response.send_message(lore_no_runes(), ephemeral=True)
             return
+
         sv = SideView(view.cog, interaction.user.id, view.diff, bet=self.bet)
         await interaction.response.edit_message(embed=sv.make_embed(), view=sv)
 
@@ -576,11 +574,11 @@ class SideView(discord.ui.View):
         if self.diff.key == "cursed":
             return discord.Embed(
                 title=f"Проклятая ({int(self.diff.win_chance*100)}%) — выбери сторону",
-                description="Цена: 0.\nПобеда даст дневной доход по уровню.\nПоражение — статус.",
+                description="Цена: 0. Победа даст дневной доход по уровню.\nПоражение — статус.",
             )
         return discord.Embed(
             title="Выбор стороны",
-            description=f"Ставка: **{self.bet}**.\nВыбери сторону.",
+            description=f"Ставка: **{self.bet}**. Выбери сторону.",
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -614,12 +612,10 @@ class BackButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view = self.view  # type: ignore
         cog: CoinCog = view.cog  # type: ignore
-
         try:
             await interaction.response.defer(ephemeral=True, thinking=False)
         except Exception:
             pass
-
         prog = await cog.daily_progress(interaction.user.id)
         dv = DifficultyView(cog, interaction.user.id, prog)
         await interaction.edit_original_response(embed=dv.make_embed(), view=dv)
