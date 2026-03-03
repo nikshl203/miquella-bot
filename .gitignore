@@ -1,3 +1,14 @@
 .env
 __pycache__/
 .venv/
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/bot.sqlite3
+data/bot.sqlite3-shm
+data/bot.sqlite3-wal
+data/bot.sqlite3
+data/bot.sqlite3-shm
+data/bot.sqlite3-shm
+data/bot.sqlite3
+*.sqlite3
