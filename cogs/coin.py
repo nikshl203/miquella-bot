@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import math
 import random
 import time
@@ -45,8 +44,6 @@ DAILY_PROFIT_CAP = {"easy": 30, "mid": 140, "hard": 250}
 FEE_RATE = 0.05  # 5% (ceil), min 1 if profit > 0
 
 SIDE_NAME = {"heads": "Орёл", "tails": "Решка"}
-
-log = logging.getLogger("miquella.coin")
 
 
 def msk_day_key() -> str:
@@ -148,17 +145,10 @@ class CoinCog(commands.Cog):
         for k, cap in DAILY_PROFIT_CAP.items():
             have = 0
             if callable(dp_get):
-                # Retry a few times in case SQLite is temporarily busy (WAL / parallel queries)
-                for attempt in range(3):
-                    try:
-                        have = int(await dp_get(user_id, day, f"coin:{k}"))
-                        break
-                    except Exception as e:
-                        if attempt == 2:
-                            log.warning("dp_get failed user=%s day=%s key=%s: %r", user_id, day, f"coin:{k}", e)
-                            have = 0
-                        else:
-                            await asyncio.sleep(0.15 * (attempt + 1))
+                try:
+                    have = int(await dp_get(user_id, day, f"coin:{k}"))
+                except Exception:
+                    have = 0
             out[k] = (have, cap)
         return out
 
@@ -344,7 +334,7 @@ class CoinCog(commands.Cog):
                         have = int(await dp_get(user_id, msk_day_key(), f"coin:{diff.key}"))
                     except Exception:
                         have = 0
-                result_embed.add_field(name="Сегодня (печать)", value=f"{have}/{cap}", inline=True)
+                result_embed.add_field(name="Лимит прибыли (сегодня)", value=f"{have + (net if win else 0)}/{cap}", inline=True)
 
         # Apply rewards
         if win and reward > 0:
@@ -358,18 +348,10 @@ class CoinCog(commands.Cog):
                 await self.repo.add_runes(user_id, int(bet) + int(net))
                 dp_add = getattr(self.repo, "dp_add", None)
                 if callable(dp_add) and net > 0:
-                    day = msk_day_key()
-                    key = f"coin:{diff.key}"
-                    # Retry a few times; previously failures were silently swallowed.
-                    for attempt in range(3):
-                        try:
-                            await dp_add(user_id, day, key, int(net))
-                            break
-                        except Exception as e:
-                            if attempt == 2:
-                                log.warning("dp_add failed user=%s day=%s key=%s net=%s: %r", user_id, day, key, int(net), e)
-                            else:
-                                await asyncio.sleep(0.2 * (attempt + 1))
+                    try:
+                        await dp_add(user_id, msk_day_key(), f"coin:{diff.key}", int(net))
+                    except Exception:
+                        pass
 
         # Send final
         try:
