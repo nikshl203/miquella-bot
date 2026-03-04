@@ -11,6 +11,29 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Tuple
 
+# Import limit helpers from the shared game_limits module. If the module or imports
+# are unavailable, fallback functions will be defined below.
+try:
+    from game_limits import (
+        add_progress as limits_add_progress,
+        can_play as limits_can_play,
+        format_progress as limits_format_progress,
+        get_limit_value as limits_get_limit_value,
+        get_progress as limits_get_progress,
+    )
+except Exception:
+    # fallback definitions if game_limits cannot be imported
+    async def limits_add_progress(repo, user_id: int, key: str, amount: int) -> None:
+        return None
+    async def limits_format_progress(repo, user_id: int, key: str) -> str:
+        return "0/0"
+    async def limits_can_play(repo, user_id: int, key: str, expected_gain: int = 0):
+        return True, 0, 0
+    def limits_get_limit_value(key: str) -> int:
+        return 0
+    async def limits_get_progress(repo, user_id: int, key: str) -> int:
+        return 0
+
 import discord
 from discord.ext import commands
 
@@ -139,16 +162,43 @@ class CoinCog(commands.Cog):
         return f"coin:{diff_key}"
 
     async def daily_progress(self, user_id: int) -> Dict[str, Tuple[int, int]]:
-        day = msk_day_key()
+        """
+        Return current progress and cap values for each coin difficulty for the given user.
+
+        This method attempts to use the shared limits module to retrieve the user's
+        progress and the configured cap. If the limits module is not available,
+        it falls back to the legacy behaviour using ``DAILY_PROFIT_CAP`` and
+        ``Repo.dp_get``.
+
+        Parameters
+        ----------
+        user_id: int
+            Discord user ID for whom to fetch progress.
+
+        Returns
+        -------
+        dict[str, tuple[int, int]]
+            Mapping of difficulty keys ("easy", "mid", "hard") to a pair
+            ``(current, cap)``.
+        """
         out: Dict[str, Tuple[int, int]] = {}
-        dp_get = getattr(self.repo, "dp_get", None)
-        for k, cap in DAILY_PROFIT_CAP.items():
-            have = 0
-            if callable(dp_get):
-                try:
-                    have = int(await dp_get(user_id, day, f"coin:{k}"))
-                except Exception:
-                    have = 0
+        for k, default_cap in DAILY_PROFIT_CAP.items():
+            limit_key = f"coin:{k}"
+            # Try to use limits module functions
+            try:
+                have = int(await limits_get_progress(self.repo, user_id, limit_key))
+                cap = limits_get_limit_value(limit_key)
+            except Exception:
+                # fallback to legacy logic
+                cap = default_cap
+                day = msk_day_key()
+                dp_get = getattr(self.repo, "dp_get", None)
+                have = 0
+                if callable(dp_get):
+                    try:
+                        have = int(await dp_get(user_id, day, limit_key))
+                    except Exception:
+                        have = 0
             out[k] = (have, cap)
         return out
 
@@ -165,19 +215,34 @@ class CoinCog(commands.Cog):
             left = max(1, (until - now) // 60)
             return False, f"Пустота просит паузу. Вернись через ~{left} мин."
 
-        cap = DAILY_PROFIT_CAP.get(diff.key)
-        if cap is not None and not self.is_admin(user_id):
-            day = msk_day_key()
-            dp_get = getattr(self.repo, "dp_get", None)
-            have = 0
-            if callable(dp_get):
+        # Daily profit limit check using the shared limits module. Cursed games
+        # have no limit, and admins bypass the limit.
+        if diff.key != "cursed" and not self.is_admin(user_id):
+            limit_key = f"coin:{diff.key}"
+            try:
+                allowed, have, cap = await limits_can_play(self.repo, user_id, limit_key, expected_gain=0)
+            except Exception:
+                # fallback to legacy behaviour if limits module fails
+                cap = DAILY_PROFIT_CAP.get(diff.key)
+                allowed = True
+                have = 0
+                if cap is not None:
+                    day = msk_day_key()
+                    dp_get = getattr(self.repo, "dp_get", None)
+                    if callable(dp_get):
+                        try:
+                            have = int(await dp_get(user_id, day, limit_key))
+                        except Exception:
+                            have = 0
+                    allowed = have < cap
+            if cap is not None and not allowed:
+                # Build progress string for message
                 try:
-                    have = int(await dp_get(user_id, day, f"coin:{diff.key}"))
+                    progress_str = await limits_format_progress(self.repo, user_id, limit_key)
                 except Exception:
-                    have = 0
-            if have >= cap:
+                    progress_str = f"{have}/{cap}"
                 msg = (
-                    f"Печать Пустоты на сегодня закрыта: **{have}/{cap}** чистой удачи.\n"
+                    f"Печать Пустоты на сегодня закрыта: **{progress_str}** чистой удачи.\n"
                     "Вернись завтра (по МСК) или выбери другую сложность."
                 )
                 return False, msg
@@ -318,6 +383,9 @@ class CoinCog(commands.Cog):
         if diff.key == "cursed":
             result_embed.add_field(name="Награда", value=f"+{reward} рун", inline=True)
         else:
+            # For non-cursed games, display raw profit, fee and net profit now. We'll add the
+            # limit progress field later once rewards have been applied and the progress
+            # updated.
             profit = int(reward) if win else 0
             fee = fee_from_profit(profit) if win else 0
             net = max(0, profit - fee)
@@ -325,18 +393,7 @@ class CoinCog(commands.Cog):
             result_embed.add_field(name="Дань Бездне", value=f"-{fee}", inline=True)
             result_embed.add_field(name="Чистая прибыль", value=f"+{net}", inline=True)
 
-            cap = DAILY_PROFIT_CAP.get(diff.key)
-            if cap is not None:
-                have = 0
-                dp_get = getattr(self.repo, "dp_get", None)
-                if callable(dp_get):
-                    try:
-                        have = int(await dp_get(user_id, msk_day_key(), f"coin:{diff.key}"))
-                    except Exception:
-                        have = 0
-                result_embed.add_field(name="Лимит прибыли (сегодня)", value=f"{have + (net if win else 0)}/{cap}", inline=True)
-
-        # Apply rewards
+        # Apply rewards and update daily profit progress
         if win and reward > 0:
             if diff.key == "cursed":
                 await self.repo.add_runes(user_id, int(reward))
@@ -346,12 +403,43 @@ class CoinCog(commands.Cog):
                 net = max(0, profit - fee)
                 # bet is returned + net profit
                 await self.repo.add_runes(user_id, int(bet) + int(net))
-                dp_add = getattr(self.repo, "dp_add", None)
-                if callable(dp_add) and net > 0:
+                # update limit progress for coin games when net > 0
+                if net > 0:
                     try:
-                        await dp_add(user_id, msk_day_key(), f"coin:{diff.key}", int(net))
+                        await limits_add_progress(self.repo, user_id, f"coin:{diff.key}", int(net))
                     except Exception:
-                        pass
+                        # fallback to legacy dp_add if limits module is not available
+                        dp_add = getattr(self.repo, "dp_add", None)
+                        if callable(dp_add):
+                            try:
+                                await dp_add(user_id, msk_day_key(), f"coin:{diff.key}", int(net))
+                            except Exception:
+                                pass
+
+        # Before sending the final embed, append the updated limit progress field for non-cursed games.
+        if diff.key != "cursed":
+            try:
+                progress_str = await limits_format_progress(self.repo, user_id, f"coin:{diff.key}")
+            except Exception:
+                # fallback to manual computation if limits module fails
+                cap = DAILY_PROFIT_CAP.get(diff.key)
+                if cap is not None:
+                    day = msk_day_key()
+                    dp_get = getattr(self.repo, "dp_get", None)
+                    have = 0
+                    if callable(dp_get):
+                        try:
+                            have = int(await dp_get(user_id, day, f"coin:{diff.key}"))
+                        except Exception:
+                            have = 0
+                    progress_str = f"{have}/{cap}"
+                else:
+                    progress_str = "0/0"
+            result_embed.add_field(
+                name="Лимит прибыли (сегодня)",
+                value=progress_str,
+                inline=True,
+            )
 
         # Send final
         try:
