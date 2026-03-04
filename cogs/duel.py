@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from io import BytesIO
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -54,8 +53,12 @@ CELL_CENTERS = [
 ]
 
 
-def render_arena(cm_pos: Tuple[int, int], hook_pos: Tuple[int, int]) -> BytesIO:
-    """Render arena into memory (safe for parallel matches)."""
+def render_arena(cm_pos: Tuple[int, int], hook_pos: Tuple[int, int]) -> Path:
+    """
+    cm_pos/hook_pos: (col,row)
+    """
+    out_path = ASSETS / "arena_out.png"
+
     arena = Image.open(ARENA_PATH).convert("RGBA")
     cm = Image.open(CM_PATH).convert("RGBA")
     hook = Image.open(HOOK_PATH).convert("RGBA")
@@ -74,10 +77,8 @@ def render_arena(cm_pos: Tuple[int, int], hook_pos: Tuple[int, int]) -> BytesIO:
     paste_icon(arena, cm, cm_pos[0], cm_pos[1])
     paste_icon(arena, hook, hook_pos[0], hook_pos[1])
 
-    bio = BytesIO()
-    arena.save(bio, format="PNG")
-    bio.seek(0)
-    return bio
+    arena.save(out_path.as_posix())
+    return out_path
 
 
 @dataclass
@@ -112,17 +113,13 @@ class DuelMatch:
     task_turn_timeout: Optional[asyncio.Task] = None
 
 
-def get_persistent_views(bot: commands.Bot):
-    return [StartDuelView()]
-
-
 class DuelCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.matches: Dict[int, DuelMatch] = {}
 
         # ✅ persistent view для кнопки "Играть" на закреплённой панели
-        # persistent view регистрируется через cogs/persistent.py
+        bot.add_view(StartDuelView(self))
 
     async def _get_level(self, user_id: int) -> int:
         repo = getattr(self.bot, "repo", None)
@@ -438,7 +435,7 @@ class DuelCog(commands.Cog):
         if match.hook_row == match.cm_row:
             await channel.send(
                 f"🎣 **ПОПАДАНИЕ!** Пудж угадал линию на шаге {match.round_index + 1}.",
-                file=discord.File(img_path, filename="arena.png"),
+                file=discord.File(img_path.as_posix(), filename="arena.png"),
                 delete_after=20,
             )
             await self.finish_match(channel, match, winner="pudge", reason="Совпала линия.")
@@ -446,7 +443,7 @@ class DuelCog(commands.Cog):
 
         await channel.send(
             f"❄️ ЦМ ускользнула на шаге {match.round_index + 1}.",
-            file=discord.File(img_path, filename="arena.png"),
+            file=discord.File(img_path.as_posix(), filename="arena.png"),
             delete_after=20,
         )
 
@@ -573,8 +570,9 @@ class DuelCog(commands.Cog):
 # ---------------- Views ----------------
 
 class StartDuelView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, cog: DuelCog):
         super().__init__(timeout=None)
+        self.cog = cog
 
     @discord.ui.button(label="Играть", style=discord.ButtonStyle.primary, custom_id="duel:start")
     async def play(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -582,14 +580,8 @@ class StartDuelView(discord.ui.View):
         if not isinstance(ch, discord.TextChannel):
             await interaction.response.send_message("⚠️ Канал не найден.", ephemeral=True)
             return
-
-        cog = interaction.client.get_cog("DuelCog")  # type: ignore
-        if not cog:
-            await interaction.response.send_message("⚠️ Ког дуэли не загружен.", ephemeral=True)
-            return
-
         await interaction.response.send_message("✅ Матч открыт.", ephemeral=True)
-        await cog.start_lobby(ch, interaction.user)  # type: ignore
+        await self.cog.start_lobby(ch, interaction.user)  # type: ignore
 
 
 class LobbyView(discord.ui.View):
