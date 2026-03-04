@@ -23,16 +23,106 @@ try:
     )
 except Exception:
     # fallback definitions if game_limits cannot be imported
+    #
+    # In the absence of the shared limits module, we still want to track and enforce
+    # daily limits using the legacy dp_get/dp_add methods from Repo and the
+    # default caps defined in this cog (DAILY_PROFIT_CAP). These fallback
+    # functions implement that behaviour. They mirror the signatures of the
+    # functions from game_limits so that the rest of this cog can call them
+    # transparently. See issue #XXX for discussion.
+
     async def limits_add_progress(repo, user_id: int, key: str, amount: int) -> None:
-        return None
-    async def limits_format_progress(repo, user_id: int, key: str) -> str:
-        return "0/0"
-    async def limits_can_play(repo, user_id: int, key: str, expected_gain: int = 0):
-        return True, 0, 0
-    def limits_get_limit_value(key: str) -> int:
-        return 0
+        """Add progress to the daily counter via dp_add when the limits module is unavailable.
+
+        Parameters
+        ----------
+        repo: Repo
+            The database repository object providing dp_add().
+        user_id: int
+            The Discord user ID.
+        key: str
+            The limit key (e.g. 'coin:easy').
+        amount: int
+            Amount of profit to record. Negative or zero amounts are ignored.
+        """
+        amt = int(amount)
+        if amt <= 0:
+            return
+        # Use Repo.dp_add to increment the daily_profit table directly
+        dp_add = getattr(repo, "dp_add", None)
+        if callable(dp_add):
+            try:
+                day = msk_day_key()
+                await dp_add(user_id, day, key, amt)
+            except Exception:
+                # swallow exceptions silently to match behaviour of the imported
+                # limits module
+                pass
+        return
+
     async def limits_get_progress(repo, user_id: int, key: str) -> int:
+        """Get current progress from the daily_profit table via dp_get.
+
+        Returns
+        -------
+        int
+            Current recorded progress for this user and key, or 0 if unavailable.
+        """
+        dp_get = getattr(repo, "dp_get", None)
+        if callable(dp_get):
+            try:
+                day = msk_day_key()
+                return int(await dp_get(user_id, day, key))
+            except Exception:
+                return 0
         return 0
+
+    def limits_get_limit_value(key: str) -> int:
+        """Return the default cap for a given limit key.
+
+        The key is expected to be in the form '<namespace>:<diff>', e.g. 'coin:easy'.
+        If the namespace is 'coin', we look up the cap in DAILY_PROFIT_CAP. Unknown
+        keys return 0.
+        """
+        try:
+            # Extract the difficulty part (after the colon) and look up cap
+            ns, diff_key = key.split(":", 1)
+        except ValueError:
+            diff_key = key
+        return int(DAILY_PROFIT_CAP.get(diff_key, 0))
+
+    async def limits_format_progress(repo, user_id: int, key: str) -> str:
+        """Format progress for display using fallback methods.
+
+        Returns a string of the form 'current/cap'. Unknown keys produce '0/0'.
+        """
+        have = await limits_get_progress(repo, user_id, key)
+        cap = limits_get_limit_value(key)
+        return f"{have}/{cap}"
+
+    async def limits_can_play(repo, user_id: int, key: str, expected_gain: int = 0):
+        """Check if the user is allowed to play under the fallback limit system.
+
+        Implements the same overshoot-allowed logic as the real limits module. If
+        the default cap is zero (unknown), always allow.
+
+        Returns
+        -------
+        tuple[bool, int, int]
+            A tuple of (allowed, current, limit).
+        """
+        cap = limits_get_limit_value(key)
+        if cap <= 0:
+            return True, 0, 0
+        current = await limits_get_progress(repo, user_id, key)
+        # allow if not yet at cap
+        if current < cap:
+            return True, current, cap
+        # allow if the expected gain overshoots the cap but player hasn't yet
+        # reached the total of cap + expected_gain
+        if expected_gain > 0 and current < cap + expected_gain:
+            return True, current, cap
+        return False, current, cap
 
 import discord
 from discord.ext import commands
@@ -199,6 +289,9 @@ class CoinCog(commands.Cog):
                         have = int(await dp_get(user_id, day, limit_key))
                     except Exception:
                         have = 0
+            # If the cap returned from the limits module is zero or negative, fall back to the default cap
+            if cap is None or cap <= 0:
+                cap = default_cap
             out[k] = (have, cap)
         return out
 
@@ -420,8 +513,12 @@ class CoinCog(commands.Cog):
         if diff.key != "cursed":
             try:
                 progress_str = await limits_format_progress(self.repo, user_id, f"coin:{diff.key}")
+                # If the limits module returns a cap of zero, fall back to default cap values
+                curr, cap = progress_str.split("/") if "/" in progress_str else ("0", "0")
+                if int(cap) <= 0:
+                    raise ValueError
             except Exception:
-                # fallback to manual computation if limits module fails
+                # fallback to manual computation if limits module fails or returns zero cap
                 cap = DAILY_PROFIT_CAP.get(diff.key)
                 if cap is not None:
                     day = msk_day_key()
