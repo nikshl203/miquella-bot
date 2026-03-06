@@ -23,6 +23,20 @@ def _parse_custom_emoji(key: str) -> discord.PartialEmoji:
     return discord.PartialEmoji(name=key)
 
 
+def _mapping_for_message(cfg: dict, message_id: int) -> tuple[dict[str, int], bool]:
+    age_id = int(cfg["survey"]["age_message_id"])
+    reg_id = int(cfg["survey"]["region_message_id"])
+    games_id = int(cfg["survey"]["games_message_id"])
+
+    if int(message_id) == age_id:
+        return {k: int(v) for k, v in cfg["survey_age"].items()}, True
+    if int(message_id) == reg_id:
+        return {k: int(v) for k, v in cfg["survey_region"].items()}, True
+    if int(message_id) == games_id:
+        return {k: int(v) for k, v in cfg["survey_games"].items()}, False
+    return {}, False
+
+
 class SurveyCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -63,21 +77,9 @@ class SurveyCog(commands.Cog):
         if self.bot.user and payload.user_id == self.bot.user.id:
             return
 
-        age_id = int(cfg["survey"]["age_message_id"])
-        reg_id = int(cfg["survey"]["region_message_id"])
-        games_id = int(cfg["survey"]["games_message_id"])
-        if payload.message_id not in (age_id, reg_id, games_id):
+        mapping, exclusive = _mapping_for_message(cfg, payload.message_id)
+        if not mapping:
             return
-
-        if payload.message_id == age_id:
-            mapping = {k: int(v) for k, v in cfg["survey_age"].items()}
-            exclusive = True
-        elif payload.message_id == reg_id:
-            mapping = {k: int(v) for k, v in cfg["survey_region"].items()}
-            exclusive = True
-        else:
-            mapping = {k: int(v) for k, v in cfg["survey_games"].items()}
-            exclusive = False
 
         ek = _emoji_key(payload.emoji)
         role_id = mapping.get(ek)
@@ -115,6 +117,41 @@ class SurveyCog(commands.Cog):
         if role and role not in member.roles:
             try:
                 await member.add_roles(role, reason="survey")
+            except Exception:
+                pass
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        cfg = self.bot.cfg  # type: ignore
+        if payload.guild_id != int(cfg["guild_id"]):
+            return
+        if self.bot.user and payload.user_id == self.bot.user.id:
+            return
+
+        mapping, _ = _mapping_for_message(cfg, payload.message_id)
+        if not mapping:
+            return
+
+        ek = _emoji_key(payload.emoji)
+        role_id = mapping.get(ek)
+        if not role_id:
+            return
+
+        g = self.bot.get_guild(int(cfg["guild_id"]))
+        if not g:
+            return
+
+        member = g.get_member(payload.user_id)
+        if not member:
+            try:
+                member = await g.fetch_member(payload.user_id)
+            except Exception:
+                return
+
+        role = g.get_role(role_id)
+        if role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="survey reaction removed")
             except Exception:
                 pass
 

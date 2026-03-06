@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import logging
 import traceback
 from pathlib import Path
@@ -102,7 +103,13 @@ def main() -> None:
     except Exception:
         print("\n!!! CRASH DURING STARTUP !!!", flush=True)
         traceback.print_exc()
-        input("\nНажми Enter чтобы закрыть окно...")
+        # For local desktop usage we keep pause-on-crash,
+        # but avoid blocking in headless/server environments.
+        if sys.stdin is not None and sys.stdin.isatty():
+            try:
+                input("\nНажми Enter чтобы закрыть окно...")
+            except EOFError:
+                pass
 
 
 if __name__ == "__main__":
