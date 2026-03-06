@@ -14,8 +14,6 @@ import discord
 from discord.ext import commands
 
 from ._interactions import GuardedView, safe_defer_ephemeral, safe_edit_message, safe_send
-from game_limits import add_progress as limits_add_progress
-from game_limits import get_progress as limits_get_progress
 from time_utils import msk_day_key
 
 log = logging.getLogger("void.coin")
@@ -146,13 +144,7 @@ class CoinCog(commands.Cog):
         day = msk_day_key()
         key = self._limit_db_key(diff_key)
 
-        # Main path through shared limits module.
-        try:
-            return int(await limits_get_progress(self.repo, user_id, key))
-        except Exception:
-            log.exception("coin limit read failed via game_limits user=%s diff=%s", user_id, diff_key)
-
-        # Fallback path via repo helper.
+        # Main path via repo helper.
         dp_get = getattr(self.repo, "dp_get", None)
         if callable(dp_get):
             try:
@@ -190,19 +182,7 @@ class CoinCog(commands.Cog):
         day = msk_day_key()
         key = self._limit_db_key(diff_key)
 
-        # Main path through shared limits module.
-        try:
-            await limits_add_progress(self.repo, user_id, key, delta_i)
-            return True
-        except Exception:
-            log.exception(
-                "coin limit write failed via game_limits user=%s diff=%s delta=%s",
-                user_id,
-                diff_key,
-                delta_i,
-            )
-
-        # Fallback path via repo helper.
+        # Main path via repo helper.
         dp_add = getattr(self.repo, "dp_add", None)
         if callable(dp_add):
             try:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import math
 import time
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ import discord
 from discord.ext import commands
 from PIL import Image
 
-from ._interactions import GuardedView, safe_defer_ephemeral, safe_defer_update, safe_edit_message, safe_send
+from ._interactions import GuardedView, safe_send
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "assets" / "duel"
@@ -55,12 +56,10 @@ CELL_CENTERS = [
 ]
 
 
-def render_arena(cm_pos: Tuple[int, int], hook_pos: Tuple[int, int]) -> Path:
+def render_arena_png(cm_pos: Tuple[int, int], hook_pos: Tuple[int, int]) -> bytes:
     """
     cm_pos/hook_pos: (col,row)
     """
-    out_path = ASSETS / "arena_out.png"
-
     arena = Image.open(ARENA_PATH).convert("RGBA")
     cm = Image.open(CM_PATH).convert("RGBA")
     hook = Image.open(HOOK_PATH).convert("RGBA")
@@ -79,8 +78,9 @@ def render_arena(cm_pos: Tuple[int, int], hook_pos: Tuple[int, int]) -> Path:
     paste_icon(arena, cm, cm_pos[0], cm_pos[1])
     paste_icon(arena, hook, hook_pos[0], hook_pos[1])
 
-    arena.save(out_path.as_posix())
-    return out_path
+    out = io.BytesIO()
+    arena.save(out, format="PNG")
+    return out.getvalue()
 
 
 @dataclass
@@ -460,13 +460,17 @@ class DuelCog(commands.Cog):
         hook_pos = (col, match.hook_row)
         cm_pos = (col, match.cm_row)
 
-        img_path = render_arena(cm_pos=cm_pos, hook_pos=hook_pos)
+        arena_png = render_arena_png(cm_pos=cm_pos, hook_pos=hook_pos)
+        arena_filename = f"arena_{channel.id}_{match.round_index + 1}_{int(time.time() * 1000)}.png"
+
+        def _arena_file() -> discord.File:
+            return discord.File(io.BytesIO(arena_png), filename=arena_filename)
 
         # ✅ картинки арены тоже не копим: auto-delete
         if match.hook_row == match.cm_row:
             await channel.send(
                 f"🎣 **ПОПАДАНИЕ!** Пудж угадал линию на шаге {match.round_index + 1}.",
-                file=discord.File(img_path.as_posix(), filename="arena.png"),
+                file=_arena_file(),
                 delete_after=20,
             )
             await self.finish_match(channel, match, winner="pudge", reason="Совпала линия.")
@@ -474,7 +478,7 @@ class DuelCog(commands.Cog):
 
         await channel.send(
             f"❄️ ЦМ ускользнула на шаге {match.round_index + 1}.",
-            file=discord.File(img_path.as_posix(), filename="arena.png"),
+            file=_arena_file(),
             delete_after=20,
         )
 
@@ -515,10 +519,12 @@ class DuelCog(commands.Cog):
             win_side_name = "ЦМ"
 
         # Списание у проигравшего дуэлянта происходит только по итогу.
-        loser_loss = await self._deduct_loss(loser_id, match.stake) if match.stake > 0 else 0
+        required_loss = int(match.stake) if match.stake > 0 else 0
+        loser_loss = await self._deduct_loss(loser_id, required_loss) if required_loss > 0 else 0
 
-        # Выплата победителю (если ставка 0 — выплата 0).
-        payout = ceil_int(match.stake * coef) if match.stake > 0 else 0
+        # Выплата победителю считается от фактически списанной суммы,
+        # чтобы нельзя было увести руны после подтверждения и оставить полную выплату.
+        payout = ceil_int(loser_loss * coef) if loser_loss > 0 else 0
         if payout > 0:
             await repo.add_runes(winner_id, payout)
 
@@ -549,6 +555,12 @@ class DuelCog(commands.Cog):
                 f"Выплата победителю: **+{payout} рун**."
             ),
         )
+        if required_loss > 0 and loser_loss < required_loss:
+            fin_embed.add_field(
+                name="⚠️ Пересчёт выплаты",
+                value="Проигравший не смог покрыть полную ставку к финалу. Выплата рассчитана от фактического списания.",
+                inline=False,
+            )
         file = None
         if BANNER_PATH.exists():
             file = discord.File(BANNER_PATH.as_posix(), filename="duel_banner.png")
@@ -574,6 +586,8 @@ class DuelCog(commands.Cog):
             f"Ставочникам начислено: +{bettors_payout_total}\n"
             f"Со ставочников списано: -{bettors_loss_total}"
         )
+        if required_loss > 0 and loser_loss < required_loss:
+            text += f"\n⚠️ Недостаток средств у проигравшего: {loser_loss}/{required_loss}."
         await self._send_results(channel.guild, text)
 
         # чистим лобби если осталось

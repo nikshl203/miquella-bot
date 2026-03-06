@@ -298,6 +298,12 @@ CREATE TABLE IF NOT EXISTS tendrils(
         await self.ensure_user(user_id)
 
         cost_i = int(cost)
+        if cost_i < 0:
+            log.warning("Rejected negative spend_runes cost: user=%s cost=%s", user_id, cost_i)
+            return False
+        if cost_i == 0:
+            return True
+
         # Атомарно: UPDATE с условием по балансу, чтобы избежать гонок при одновременных кликах.
         cur = await self.conn.execute(
             "UPDATE users SET runes = runes - ? WHERE user_id=? AND runes >= ?",

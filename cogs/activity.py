@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import datetime as _dt
 
 from time_utils import msk_day_key
 from economy_utils import economy_per_day
@@ -61,7 +60,7 @@ class ActivityCog(commands.Cog):
 
         # ---- chat settings ----
         self.chat_share: float = float(chat.get("share", 0.20))
-        self.chat_cooldown_seconds: int = _digits(chat.get("cooldown_seconds", 60), 600)
+        self.chat_cooldown_seconds: int = _digits(chat.get("cooldown_seconds", 60), 60)
         self.chat_min_chars_no_space: int = _digits(chat.get("min_chars_no_space", 10), 10)
 
         base_reward = chat.get("base_reward", {}) or {}

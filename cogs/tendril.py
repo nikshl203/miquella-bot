@@ -9,7 +9,7 @@ from typing import Any, Optional
 import discord
 from discord.ext import commands, tasks
 
-from ._interactions import GuardedView, safe_defer_ephemeral, safe_defer_update, safe_edit_message, safe_send
+from ._interactions import GuardedView, safe_edit_message, safe_send
 
 
 def _digits(v: Any, default: int = 0) -> int:
@@ -53,9 +53,9 @@ class TendrilCfg:
     min_target_level: int = 10
 
     # экономика
-    attack_cost: int = 60
+    attack_cost: int = 70
     shield_cost: int = 100
-    min_target_runes: int = 20
+    min_target_runes: int = 70
 
     # тайминги
     tick_seconds: int = 10 * 60
@@ -70,10 +70,15 @@ class TendrilCfg:
     remove_attempt_cd_seconds: int = 10 * 60  # кд между попытками снятия
 
     # сколько рун ест за тик: берем дневной доход жертвы и множим на 5%
-    # per_tick = clamp(round(per_day * 0.05), 1..4)
+    # per_tick = clamp(round(per_day * 0.05), 1..3)
     per_day_pct: float = 0.05
     per_tick_min: int = 1
-    per_tick_max: int = 4
+    per_tick_max: int = 3
+
+
+ATTACK_FIRST_BITE = 30
+CURSE_FIRST_BITE = 10
+CURSE_MAX_TOTAL = 60
 
 
 LORE_INFECT_CURSE = [
@@ -135,7 +140,7 @@ LORE_RIP_SHIELD = [
 class TendrilPanelView(GuardedView):
     def __init__(self, *, attack_cost: int = TendrilCfg.attack_cost, shield_cost: int = TendrilCfg.shield_cost):
         super().__init__(timeout=None)
-        self.cast_btn.label = f"Наслать отросток ({int(attack_cost)})"
+        self.cast_btn.label = f"Наслать отросток ({int(attack_cost)} рун)"
         self.buy_shield_btn.label = f"Купить щит 72ч ({int(shield_cost)})"
 
     @discord.ui.button(label="Статус", style=discord.ButtonStyle.secondary, custom_id="tendril:status")
@@ -626,17 +631,47 @@ class TendrilCog(commands.Cog):
             await repo.cd_set(victim.id, "tendril:immunity", int(self.cfg.immunity_seconds))
 
         attacker_id = attacker.id if attacker else 0
+        u_v = await repo.get_user(victim.id)
+        v_runes = int(u_v.get("runes", 0))
+
+        # Для проклятия от монетки: если у цели уже 0 рун — отросток не стартует.
+        if source == "curse" and v_runes <= 0:
+            return False, "У цели нет рун: проклятие не за что цеплять."
+
+        first_bite = ATTACK_FIRST_BITE if source == "attack" else CURSE_FIRST_BITE
+        first_take = 0
+        if v_runes > 0 and first_bite > 0:
+            first_take = min(int(first_bite), int(v_runes))
+            if first_take > 0:
+                await repo.set_user_fields(victim.id, runes=max(0, int(v_runes) - int(first_take)))
+                if source == "attack" and attacker_id:
+                    u_a = await repo.get_user(attacker_id)
+                    await repo.set_user_fields(attacker_id, runes=int(u_a.get("runes", 0)) + int(first_take))
+
+        # Для проклятия: если после первого укуса руны 0 — отросток сразу отпадает.
+        v_left_after_bite = max(0, int(v_runes) - int(first_take))
+        if source == "curse" and v_left_after_bite <= 0:
+            ch_now = self._announce_channel(victim.guild)
+            if ch_now:
+                await ch_now.send(f"🌫️ {victim.mention} обнулён первым укусом проклятия. Отросток отпал сразу.")
+            return True, "CURSE_DRIED_ON_BITE"
+
         await self._db_insert(victim.id, source=source, attacker_id=attacker_id)
+        if first_take > 0:
+            await self._db_update(victim.id, stolen_total=int(first_take))
 
         # публичное объявление
         ch = self._announce_channel(victim.guild)
         if ch:
             if source == "attack":
-                msg = random.choice(LORE_INFECT_ATTACK).format(v=victim.mention)
-                # можно упомянуть кастера — атмосферно
-                msg += f" (ритуал: {attacker.mention})" if attacker else ""
+                msg = random.choice(LORE_INFECT_ATTACK).format(
+                    v=victim.mention,
+                    a=(attacker.mention if attacker else "неизвестный"),
+                )
             else:
                 msg = random.choice(LORE_INFECT_CURSE).format(v=victim.mention)
+            if first_take > 0:
+                msg += f"\nПервый укус: **-{first_take}** рун."
             await ch.send(msg)
 
         return True, "OK"
@@ -692,6 +727,7 @@ class TendrilCog(commands.Cog):
             # тики (каждые 10 минут)
             due = (now - last_tick_ts) // int(self.cfg.tick_seconds)
             if due > 0:
+                remove_curse_now = False
                 # берем жертву
                 victim = guild.get_member(victim_id)
                 if victim:
@@ -701,37 +737,67 @@ class TendrilCog(commands.Cog):
 
                     u_runes = int(u_v.get("runes", 0))
                     total_take = 0
+                    victim_take = 0
 
-                    # сколько тиков реально съедим (если рун мало — ограничим)
-                    # считаем по-тиково, чтобы не уйти в минус
+                    # считаем по-тиково, чтобы корректно отрабатывать лимиты/истощение
                     for _ in range(int(due)):
-                        if u_runes <= 0:
-                            break
-                        take = min(int(tick_take), int(u_runes))
-                        if take <= 0:
-                            break
-                        u_runes -= take
-                        total_take += take
+                        if source == "curse":
+                            # Проклятие от монетки: максимум 60 за 6 часов и автоснятие при 0 рунах.
+                            if u_runes <= 0:
+                                remove_curse_now = True
+                                break
+                            remain_cap = max(0, int(CURSE_MAX_TOTAL) - int(stolen_total + total_take))
+                            if remain_cap <= 0:
+                                break
+                            take = min(int(tick_take), int(u_runes), int(remain_cap))
+                            if take <= 0:
+                                break
+                            u_runes -= int(take)
+                            victim_take += int(take)
+                            total_take += int(take)
+                            if u_runes <= 0:
+                                remove_curse_now = True
+                                break
+                        else:
+                            # Ритуал игрока: если руны жертвы кончились, тики продолжают
+                            # начислять атакеру добычу из Пустоты (жертва не уходит в минус).
+                            if u_runes > 0:
+                                take = min(int(tick_take), int(u_runes))
+                                if take > 0:
+                                    u_runes -= int(take)
+                                    victim_take += int(take)
+                                    total_take += int(take)
+                            else:
+                                total_take += int(tick_take)
+
+                    if victim_take > 0:
+                        # списать с жертвы (жертва никогда не уходит в минус)
+                        await repo.set_user_fields(victim_id, runes=max(0, int(u_runes)))
+
+                    # если attack — отдать атакеру всю добычу (включая Пустоту при нуле у жертвы)
+                    if total_take > 0 and source == "attack" and attacker_id:
+                        u_a = await repo.get_user(attacker_id)
+                        await repo.set_user_fields(attacker_id, runes=int(u_a.get("runes", 0)) + int(total_take))
 
                     if total_take > 0:
-                        # списать с жертвы
-                        await repo.set_user_fields(victim_id, runes=max(0, u_runes))
-
-                        # если attack — отдать атакеру
-                        if source == "attack" and attacker_id:
-                            u_a = await repo.get_user(attacker_id)
-                            await repo.set_user_fields(attacker_id, runes=int(u_a.get("runes", 0)) + int(total_take))
-
                         stolen_total += int(total_take)
 
                 # обновим last_tick_ts (сдвигаем на количество тиков)
                 last_tick_ts = last_tick_ts + int(due) * int(self.cfg.tick_seconds)
-                await self._db_update(
-                    victim_id,
-                    last_tick_ts=int(last_tick_ts),
-                    stolen_total=int(stolen_total),
-                    attempts_left=int(attempts_left),
-                )
+                if source == "curse" and remove_curse_now:
+                    await self._db_delete(victim_id)
+                    if ch_announce:
+                        m = guild.get_member(victim_id)
+                        if m:
+                            await ch_announce.send(f"🌫️ У {m.mention} руны закончились. Проклятый отросток распался.")
+                    continue
+                else:
+                    await self._db_update(
+                        victim_id,
+                        last_tick_ts=int(last_tick_ts),
+                        stolen_total=int(stolen_total),
+                        attempts_left=int(attempts_left),
+                    )
 
             # объявления каждые 30 минут
             if ch_announce and (now - last_announce_ts) >= int(self.cfg.announce_seconds):

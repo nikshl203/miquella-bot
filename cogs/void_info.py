@@ -3,16 +3,13 @@
 # =========================
 from __future__ import annotations
 
-import datetime as _dt
-
 from time_utils import msk_day_key
-from economy_utils import xp_need, economy_per_day, calc_caps
 from typing import Any, Optional, Tuple
 
 import discord
 from discord.ext import commands
 
-from ._interactions import GuardedView, safe_edit_message, safe_send
+from ._interactions import GuardedView
 
 
 def _is_admin(bot: commands.Bot, user_id: int) -> bool:
