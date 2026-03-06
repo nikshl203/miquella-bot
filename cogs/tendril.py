@@ -1,4 +1,4 @@
-# cogs/tendril.py
+﻿# cogs/tendril.py
 from __future__ import annotations
 
 import random
@@ -8,6 +8,8 @@ from typing import Any, Optional
 
 import discord
 from discord.ext import commands, tasks
+
+from ._interactions import GuardedView, safe_defer_ephemeral, safe_defer_update, safe_edit_message, safe_send
 
 
 def _digits(v: Any, default: int = 0) -> int:
@@ -52,7 +54,7 @@ class TendrilCfg:
 
     # экономика
     attack_cost: int = 60
-    shield_cost: int = 120
+    shield_cost: int = 100
     min_target_runes: int = 20
 
     # тайминги
@@ -130,9 +132,11 @@ LORE_RIP_SHIELD = [
 ]
 
 
-class TendrilPanelView(discord.ui.View):
-    def __init__(self):
+class TendrilPanelView(GuardedView):
+    def __init__(self, *, attack_cost: int = TendrilCfg.attack_cost, shield_cost: int = TendrilCfg.shield_cost):
         super().__init__(timeout=None)
+        self.cast_btn.label = f"Наслать отросток ({int(attack_cost)})"
+        self.buy_shield_btn.label = f"Купить щит 72ч ({int(shield_cost)})"
 
     @discord.ui.button(label="Статус", style=discord.ButtonStyle.secondary, custom_id="tendril:status")
     async def status_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -180,20 +184,20 @@ class CastSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.caster_id:
-            await interaction.response.send_message("Это не твой ритуал.", ephemeral=True)
+            await safe_send(interaction, "Это не твой ритуал.", ephemeral=True)
             return
         target_id = int(self.values[0])
         await self.cog.ui_cast_finish(interaction, target_id)
 
 
-class CastView(discord.ui.View):
+class CastView(GuardedView):
     def __init__(self, cog: "TendrilCog", caster_id: int, options: list[discord.SelectOption], note: str):
         super().__init__(timeout=120)
         self.add_item(CastSelect(cog, caster_id, options, note))
 
     @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.edit_message(content="Ритуал отменён.", embed=None, view=None)
+        await safe_edit_message(interaction, content="Ритуал отменён.", embed=None, view=None)
 
 
 @dataclass(frozen=True)
@@ -356,7 +360,7 @@ def _choose_puzzle(seals: list[Seal], correct: Seal, stage: int) -> tuple[str, s
     return clue, picked
 
 
-class RemovePickView(discord.ui.View):
+class RemovePickView(GuardedView):
     """
     Новая мини-игра: 1-я попытка => 4 кандидата (нужна удача)
                      2-я попытка => 2 кандидата (удачи меньше)
@@ -375,7 +379,7 @@ class RemovePickView(discord.ui.View):
 
     async def handle_pick(self, interaction: discord.Interaction, picked_sid: int) -> None:
         if interaction.user.id != self.victim_id:
-            await interaction.response.send_message("Это не твой обряд.", ephemeral=True)
+            await safe_send(interaction, "Это не твой обряд.", ephemeral=True)
             return
         await self.cog.ui_remove_pick(interaction, picked_sid, self.correct_sid)
 
@@ -393,7 +397,12 @@ class RemovePickButton(discord.ui.Button):
 class TendrilCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.cfg = TendrilCfg()
+        root_cfg = getattr(self.bot, "cfg", {}) or {}
+        tcfg = root_cfg.get("tendril", {}) or {}
+        self.cfg = TendrilCfg(
+            attack_cost=_digits(tcfg.get("attack_cost", TendrilCfg.attack_cost), TendrilCfg.attack_cost),
+            shield_cost=_digits(tcfg.get("shield_cost", TendrilCfg.shield_cost), TendrilCfg.shield_cost),
+        )
         self._loop.start()
 
     def _repo(self):
@@ -750,7 +759,7 @@ class TendrilCog(commands.Cog):
             return
 
         if not interaction.guild:
-            await interaction.response.send_message("Только на сервере.", ephemeral=True)
+            await safe_send(interaction, "Только на сервере.", ephemeral=True)
             return
 
         u = await repo.get_user(interaction.user.id)
@@ -790,7 +799,7 @@ class TendrilCog(commands.Cog):
         if cast_until > now:
             e.add_field(name="КД ритуала", value=f"ещё **{_fmt_left(cast_until - now)}**", inline=True)
 
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await safe_send(interaction, embed=e, ephemeral=True)
 
     async def ui_shield_status(self, interaction: discord.Interaction) -> None:
         repo = self._repo()
@@ -799,33 +808,33 @@ class TendrilCog(commands.Cog):
         now = _now()
         until = await repo.cd_get(interaction.user.id, "tendril:shield")
         if until > now:
-            await interaction.response.send_message(f"🛡️ Щит активен ещё **{_fmt_left(until - now)}**.", ephemeral=True)
+            await safe_send(interaction, f"🛡️ Щит активен ещё **{_fmt_left(until - now)}**.", ephemeral=True)
         else:
-            await interaction.response.send_message("🛡️ Щита нет.", ephemeral=True)
+            await safe_send(interaction, "🛡️ Щита нет.", ephemeral=True)
 
     async def ui_buy_shield(self, interaction: discord.Interaction) -> None:
         repo = self._repo()
         if not repo:
             return
         if not interaction.guild:
-            await interaction.response.send_message("Только на сервере.", ephemeral=True)
+            await safe_send(interaction, "Только на сервере.", ephemeral=True)
             return
 
         u = await repo.get_user(interaction.user.id)
         lvl = int(u.get("level", 1))
         if lvl < self.cfg.min_target_level:
-            await interaction.response.send_message(f"Щит доступен с ур.{self.cfg.min_target_level}+.", ephemeral=True)
+            await safe_send(interaction, f"Щит доступен с ур.{self.cfg.min_target_level}+.", ephemeral=True)
             return
 
         now = _now()
         until = await repo.cd_get(interaction.user.id, "tendril:shield")
         if until > now:
-            await interaction.response.send_message(f"Щит уже активен ещё **{_fmt_left(until - now)}**.", ephemeral=True)
+            await safe_send(interaction, f"Щит уже активен ещё **{_fmt_left(until - now)}**.", ephemeral=True)
             return
 
         ok = await repo.spend_runes(interaction.user.id, self.cfg.shield_cost)
         if not ok:
-            await interaction.response.send_message(f"Не хватает рун. Нужно **{self.cfg.shield_cost}**.", ephemeral=True)
+            await safe_send(interaction, f"Не хватает рун. Нужно **{self.cfg.shield_cost}**.", ephemeral=True)
             return
 
         # если на тебе был отросток — сорвать
@@ -837,7 +846,7 @@ class TendrilCog(commands.Cog):
                 await ch.send(random.choice(LORE_RIP_SHIELD).format(v=interaction.user.mention))
 
         await repo.cd_set(interaction.user.id, "tendril:shield", self.cfg.shield_seconds)
-        await interaction.response.send_message(
+        await safe_send(interaction, 
             f"🛡️ Щит куплен: **72 часа** защиты.\nЦена: **{self.cfg.shield_cost}** рун.",
             ephemeral=True,
         )
@@ -847,18 +856,18 @@ class TendrilCog(commands.Cog):
         if not repo:
             return
         if not interaction.guild:
-            await interaction.response.send_message("Только на сервере.", ephemeral=True)
+            await safe_send(interaction, "Только на сервере.", ephemeral=True)
             return
 
         t = await self._db_get(interaction.user.id)
         if not t:
-            await interaction.response.send_message("На тебе нет отростка.", ephemeral=True)
+            await safe_send(interaction, "На тебе нет отростка.", ephemeral=True)
             return
 
         now = _now()
         cd_until = await repo.cd_get(interaction.user.id, "tendril:remove_cd")
         if cd_until > now:
-            await interaction.response.send_message(
+            await safe_send(interaction, 
                 f"Подожди **{_fmt_left(cd_until - now)}** перед следующей попыткой.",
                 ephemeral=True,
             )
@@ -867,7 +876,7 @@ class TendrilCog(commands.Cog):
         attempts_left = int(t.get("attempts_left", 0))
         if attempts_left <= 0:
             left = int(t["expires_ts"]) - now
-            await interaction.response.send_message(
+            await safe_send(interaction, 
                 f"Попытки кончились. Отросток иссохнет через **{_fmt_left(left)}** (или купи щит — он срывает сразу).",
                 ephemeral=True,
             )
@@ -902,7 +911,7 @@ class TendrilCog(commands.Cog):
             color=0x2B2D31,
         )
 
-        await interaction.response.send_message(
+        await safe_send(interaction, 
             embed=e,
             view=RemovePickView(self, interaction.user.id, correct.sid, seals, candidates),
             ephemeral=True,
@@ -918,12 +927,12 @@ class TendrilCog(commands.Cog):
         now = _now()
         t = await self._db_get(interaction.user.id)
         if not t:
-            await interaction.response.edit_message(content="Отросток уже исчез.", embed=None, view=None)
+            await safe_edit_message(interaction, content="Отросток уже исчез.", embed=None, view=None)
             return
 
         if int(picked_sid) == int(correct_sid):
             await self._db_delete(interaction.user.id)
-            await interaction.response.edit_message(content="✅ Узел разрезан. Отросток снят. Шёпот стих.", embed=None, view=None)
+            await safe_edit_message(interaction, content="✅ Узел разрезан. Отросток снят. Шёпот стих.", embed=None, view=None)
             return
 
         # ошибка — минус попытка
@@ -932,7 +941,7 @@ class TendrilCog(commands.Cog):
         await repo.cd_set(interaction.user.id, "tendril:remove_cd", int(self.cfg.remove_attempt_cd_seconds))
 
         if left <= 0:
-            await interaction.response.edit_message(
+            await safe_edit_message(interaction, 
                 content="❌ Узел не поддался. Попытки кончились (ждёшь до конца 6 часов или покупаешь щит — он срывает сразу).",
                 embed=None,
                 view=None,
@@ -941,7 +950,7 @@ class TendrilCog(commands.Cog):
             hint = "Нажми «Снять отросток» ещё раз — шёпот станет яснее."
             if left == 1:
                 hint = "Нажми «Снять отросток» ещё раз — третья попытка без рандома."
-            await interaction.response.edit_message(
+            await safe_edit_message(interaction, 
                 content=f"❌ Неверная печать. Попыток осталось: **{left}**.\n{hint}",
                 embed=None,
                 view=None,
@@ -952,14 +961,14 @@ class TendrilCog(commands.Cog):
         if not repo:
             return
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Только на сервере.", ephemeral=True)
+            await safe_send(interaction, "Только на сервере.", ephemeral=True)
             return
 
         caster: discord.Member = interaction.user
         u = await repo.get_user(caster.id)
         lvl = int(u.get("level", 1))
         if lvl < self.cfg.cast_unlock:
-            await interaction.response.send_message(f"Ритуал доступен с ур.{self.cfg.cast_unlock}+.", ephemeral=True)
+            await safe_send(interaction, f"Ритуал доступен с ур.{self.cfg.cast_unlock}+.", ephemeral=True)
             return
 
         now = _now()
@@ -967,12 +976,12 @@ class TendrilCog(commands.Cog):
         # кд кастера
         until_cast = await repo.cd_get(caster.id, "tendril:cast")
         if until_cast > now:
-            await interaction.response.send_message(f"КД ритуала ещё **{_fmt_left(until_cast - now)}**.", ephemeral=True)
+            await safe_send(interaction, f"КД ритуала ещё **{_fmt_left(until_cast - now)}**.", ephemeral=True)
             return
 
         # нужно ли достаточно рун у кастера
         if int(u.get("runes", 0)) < int(self.cfg.attack_cost):
-            await interaction.response.send_message(f"Не хватает рун. Нужно **{self.cfg.attack_cost}**.", ephemeral=True)
+            await safe_send(interaction, f"Не хватает рун. Нужно **{self.cfg.attack_cost}**.", ephemeral=True)
             return
 
         # собираем кандидатов: берем топ по рунам (до 40) и фильтруем по присутствию в guild
@@ -1030,7 +1039,7 @@ class TendrilCog(commands.Cog):
                 opts.append(discord.SelectOption(label=f"{m.display_name} ({int(runes)} рун)", value=str(uid)))
 
         if not lines:
-            await interaction.response.send_message("Не нашёл целей в таблице (нет данных в БД).", ephemeral=True)
+            await safe_send(interaction, "Не нашёл целей в таблице (нет данных в БД).", ephemeral=True)
             return
 
         e = discord.Embed(
@@ -1045,10 +1054,10 @@ class TendrilCog(commands.Cog):
         )
 
         if not opts:
-            await interaction.response.send_message(embed=e, ephemeral=True)
+            await safe_send(interaction, embed=e, ephemeral=True)
             return
 
-        await interaction.response.send_message(embed=e, view=CastView(self, caster.id, opts, note=""), ephemeral=True)
+        await safe_send(interaction, embed=e, view=CastView(self, caster.id, opts, note=""), ephemeral=True)
 
     async def ui_cast_finish(self, interaction: discord.Interaction, target_id: int) -> None:
         repo = self._repo()
@@ -1064,48 +1073,48 @@ class TendrilCog(commands.Cog):
         u_c = await repo.get_user(caster.id)
         lvl = int(u_c.get("level", 1))
         if lvl < self.cfg.cast_unlock:
-            await interaction.response.send_message("Твой уровень недостаточен.", ephemeral=True)
+            await safe_send(interaction, "Твой уровень недостаточен.", ephemeral=True)
             return
 
         until_cast = await repo.cd_get(caster.id, "tendril:cast")
         if until_cast > now:
-            await interaction.response.send_message(f"КД ритуала ещё **{_fmt_left(until_cast - now)}**.", ephemeral=True)
+            await safe_send(interaction, f"КД ритуала ещё **{_fmt_left(until_cast - now)}**.", ephemeral=True)
             return
 
         target = interaction.guild.get_member(int(target_id))
         if not target or target.bot:
-            await interaction.response.send_message("Цель не найдена.", ephemeral=True)
+            await safe_send(interaction, "Цель не найдена.", ephemeral=True)
             return
 
         u_t = await repo.get_user(target.id)
         if int(u_t.get("level", 1)) < self.cfg.min_target_level:
-            await interaction.response.send_message("Не соблюдены условия ритуала: цель слишком низкого уровня.", ephemeral=True)
+            await safe_send(interaction, "Не соблюдены условия ритуала: цель слишком низкого уровня.", ephemeral=True)
             return
         if int(u_t.get("runes", 0)) < int(self.cfg.min_target_runes):
-            await interaction.response.send_message("Не соблюдены условия ритуала: у цели слишком мало рун.", ephemeral=True)
+            await safe_send(interaction, "Не соблюдены условия ритуала: у цели слишком мало рун.", ephemeral=True)
             return
         if not _is_online_or_in_voice(target):
-            await interaction.response.send_message("Не соблюдены условия ритуала: цель оффлайн и не в войсе.", ephemeral=True)
+            await safe_send(interaction, "Не соблюдены условия ритуала: цель оффлайн и не в войсе.", ephemeral=True)
             return
 
         sh = await repo.cd_get(target.id, "tendril:shield")
         if sh > now:
-            await interaction.response.send_message("Не соблюдены условия ритуала: у цели активен щит.", ephemeral=True)
+            await safe_send(interaction, "Не соблюдены условия ритуала: у цели активен щит.", ephemeral=True)
             return
 
         imm = await repo.cd_get(target.id, "tendril:immunity")
         if imm > now:
-            await interaction.response.send_message("Не соблюдены условия ритуала: у цели иммунитет 24ч.", ephemeral=True)
+            await safe_send(interaction, "Не соблюдены условия ритуала: у цели иммунитет 24ч.", ephemeral=True)
             return
 
         if await self._db_get(target.id):
-            await interaction.response.send_message("Не соблюдены условия ритуала: цель уже заражена.", ephemeral=True)
+            await safe_send(interaction, "Не соблюдены условия ритуала: цель уже заражена.", ephemeral=True)
             return
 
         # списываем цену
         ok = await repo.spend_runes(caster.id, self.cfg.attack_cost)
         if not ok:
-            await interaction.response.send_message(f"Не хватает рун. Нужно **{self.cfg.attack_cost}**.", ephemeral=True)
+            await safe_send(interaction, f"Не хватает рун. Нужно **{self.cfg.attack_cost}**.", ephemeral=True)
             return
 
         # ставим кд кастера
@@ -1118,10 +1127,10 @@ class TendrilCog(commands.Cog):
             u_back = await repo.get_user(caster.id)
             await repo.set_user_fields(caster.id, runes=int(u_back.get("runes", 0)) + int(self.cfg.attack_cost))
             await repo.cd_set(caster.id, "tendril:cast", 1)
-            await interaction.response.send_message(f"Не получилось: {why}", ephemeral=True)
+            await safe_send(interaction, f"Не получилось: {why}", ephemeral=True)
             return
 
-        await interaction.response.edit_message(content=f"✅ Ритуал завершён. Цель: {target.mention}", embed=None, view=None)
+        await safe_edit_message(interaction, content=f"✅ Ритуал завершён. Цель: {target.mention}", embed=None, view=None)
 
     # ---------------- admin panel ----------------
 
@@ -1193,13 +1202,16 @@ class TendrilCog(commands.Cog):
             title="🌿 Отросток",
             description=(
                 "Здесь совершают ритуалы и срывают паразитов.\n\n"
-                "• **Наслать отросток** (ур.15+): цель онлайн или в войсе, без щита, без иммунитета 24ч.\n"
+                f"• **Наслать отросток** (ур.15+, цена {self.cfg.attack_cost}): цель онлайн или в войсе, без щита, без иммунитета 24ч.\n"
                 "• **Проклятая монетка** (ур.10+) может дать отросток бесплатно… но за поражение.\n"
-                "• **Щит** (72ч) — дорогой, но **срывает отросток сразу** и защищает от ритуалов."
+                f"• **Щит** (72ч, цена {self.cfg.shield_cost}) — срывает отросток сразу и защищает от ритуалов."
             ),
             color=0x2B2D31,
         )
-        m = await ch.send(embed=e, view=TendrilPanelView())
+        m = await ch.send(
+            embed=e,
+            view=TendrilPanelView(attack_cost=self.cfg.attack_cost, shield_cost=self.cfg.shield_cost),
+        )
         try:
             await m.pin()
         except Exception:
@@ -1209,7 +1221,11 @@ class TendrilCog(commands.Cog):
 
 def get_persistent_views(bot: commands.Bot):
     # если ты используешь cogs/persistent.py, он подхватит это
-    return [TendrilPanelView()]
+    cfg = getattr(bot, "cfg", {}) or {}
+    tcfg = cfg.get("tendril", {}) or {}
+    attack_cost = int(tcfg.get("attack_cost", TendrilCfg.attack_cost))
+    shield_cost = int(tcfg.get("shield_cost", TendrilCfg.shield_cost))
+    return [TendrilPanelView(attack_cost=attack_cost, shield_cost=shield_cost)]
 
 
 async def setup(bot: commands.Bot) -> None:

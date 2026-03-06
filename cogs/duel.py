@@ -1,4 +1,4 @@
-# cogs/duel.py
+﻿# cogs/duel.py
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +11,8 @@ from typing import Dict, Optional, Tuple, List
 import discord
 from discord.ext import commands
 from PIL import Image
+
+from ._interactions import GuardedView, safe_defer_ephemeral, safe_defer_update, safe_edit_message, safe_send
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "assets" / "duel"
@@ -127,6 +129,39 @@ class DuelCog(commands.Cog):
             return 1
         u = await repo.get_user(user_id)
         return int(u.get("level", 1))
+
+    async def _get_runes(self, user_id: int) -> int:
+        repo = getattr(self.bot, "repo", None)
+        if repo is None:
+            return 0
+        u = await repo.get_user(int(user_id))
+        return int(u.get("runes", 0))
+
+    async def _can_cover_loss(self, user_id: int, amount: int) -> bool:
+        if int(amount) <= 0:
+            return True
+        return await self._get_runes(int(user_id)) >= int(amount)
+
+    async def _deduct_loss(self, user_id: int, amount: int) -> int:
+        """Deduct runes on defeat. Returns actual deducted amount."""
+        loss = int(amount)
+        if loss <= 0:
+            return 0
+        repo = getattr(self.bot, "repo", None)
+        if repo is None:
+            return 0
+
+        # Normal path: full loss.
+        ok = await repo.spend_runes(int(user_id), loss)
+        if ok:
+            return loss
+
+        # Fallback: take what's available (if user spent runes after placing a bet).
+        have = await self._get_runes(int(user_id))
+        if have <= 0:
+            return 0
+        ok_partial = await repo.spend_runes(int(user_id), have)
+        return have if ok_partial else 0
 
     def _is_admin(self, user_id: int) -> bool:
         cfg = getattr(self.bot, "cfg", {})  # type: ignore
@@ -336,17 +371,13 @@ class DuelCog(commands.Cog):
             self.matches.pop(channel.id, None)
             return
 
-        # ✅ если ставка 0 — просто играем без списаний
+        # Проверяем платёжеспособность заранее, но не списываем руны до финала.
         if match.stake > 0:
-            ok1 = await repo.spend_runes(match.pudge_id, match.stake)  # type: ignore
-            ok2 = await repo.spend_runes(match.cm_id, match.stake)  # type: ignore
-            if not (ok1 and ok2):
-                if ok1 and not ok2:
-                    await repo.add_runes(match.pudge_id, match.stake)  # type: ignore
-                if ok2 and not ok1:
-                    await repo.add_runes(match.cm_id, match.stake)  # type: ignore
+            can_pudge = await self._can_cover_loss(match.pudge_id, match.stake)  # type: ignore[arg-type]
+            can_cm = await self._can_cover_loss(match.cm_id, match.stake)  # type: ignore[arg-type]
+            if not (can_pudge and can_cm):
                 match.phase = "cancelled"
-                await channel.send("⛓️ Руны не сошлись. Матч отменён.", delete_after=8)
+                await channel.send("⛓️ У одного из дуэлянтов не хватает рун для возможного поражения. Матч отменён.", delete_after=8)
                 self.matches.pop(channel.id, None)
                 return
 
@@ -483,18 +514,27 @@ class DuelCog(commands.Cog):
             coef = COEF_CM
             win_side_name = "ЦМ"
 
-        # ✅ выплата победителю (если ставка 0 — выплата 0)
+        # Списание у проигравшего дуэлянта происходит только по итогу.
+        loser_loss = await self._deduct_loss(loser_id, match.stake) if match.stake > 0 else 0
+
+        # Выплата победителю (если ставка 0 — выплата 0).
         payout = ceil_int(match.stake * coef) if match.stake > 0 else 0
         if payout > 0:
             await repo.add_runes(winner_id, payout)
 
         total_bets = 0
         winners_bets = 0
+        bettors_loss_total = 0
+        bettors_payout_total = 0
         for b in list(match.bets.values()):
             total_bets += 1
             if (winner == "pudge" and b.side == "pudge") or (winner == "cm" and b.side == "cm"):
                 winners_bets += 1
-                await repo.add_runes(b.user_id, ceil_int(b.stake * coef))
+                win_amt = ceil_int(b.stake * coef)
+                bettors_payout_total += int(win_amt)
+                await repo.add_runes(b.user_id, win_amt)
+            else:
+                bettors_loss_total += await self._deduct_loss(b.user_id, b.stake)
 
         winner_m = channel.guild.get_member(winner_id)
         loser_m = channel.guild.get_member(loser_id)
@@ -502,7 +542,12 @@ class DuelCog(commands.Cog):
         # ✅ красивая финальная карточка с баннером (и сама исчезнет)
         fin_embed = discord.Embed(
             title="🏁 Дуэль завершена",
-            description=f"Победа: **{win_side_name}**\nПричина: *{reason}*\nВыплата победителю: **+{payout} рун**.",
+            description=(
+                f"Победа: **{win_side_name}**\n"
+                f"Причина: *{reason}*\n"
+                f"Списано у проигравшего: **-{loser_loss} рун**\n"
+                f"Выплата победителю: **+{payout} рун**."
+            ),
         )
         file = None
         if BANNER_PATH.exists():
@@ -523,8 +568,11 @@ class DuelCog(commands.Cog):
             f"Победитель: {winner_m.mention if winner_m else winner_id}\n"
             f"Проигравший: {loser_m.mention if loser_m else loser_id}\n"
             f"Ставка: {match.stake}\n"
+            f"Списано у проигравшего: -{loser_loss}\n"
             f"Выплата: +{payout}\n"
-            f"Ставочники: {winners_bets}/{total_bets} выиграли"
+            f"Ставочники: {winners_bets}/{total_bets} выиграли\n"
+            f"Ставочникам начислено: +{bettors_payout_total}\n"
+            f"Со ставочников списано: -{bettors_loss_total}"
         )
         await self._send_results(channel.guild, text)
 
@@ -549,19 +597,19 @@ class DuelCog(commands.Cog):
             return
         lvl = await self._get_level(user.id)
         if not can_play_duel(lvl):
-            await interaction.response.send_message("⛓️ Тебе ещё рано для ставок дуэли (нужно 15+).", ephemeral=True)
+            await safe_send(interaction, "⛓️ Тебе ещё рано для ставок дуэли (нужно 15+).", ephemeral=True)
             return
 
         opts = stake_options_for_level(lvl)
         if not opts:
-            await interaction.response.send_message("⛓️ Тебе ещё рано.", ephemeral=True)
+            await safe_send(interaction, "⛓️ Тебе ещё рано.", ephemeral=True)
             return
 
         view = BettorStakeView(self, match, user_id=user.id, options=opts)
-        await interaction.response.send_message(
+        await safe_send(interaction, 
             "💰 Ставочник: выбери сторону и ставку.\n"
-            "Если матч отменится — ставка вернётся.\n"
-            "Если проиграешь — ставка сгорит.",
+            "Руны списываются только по итогу матча.\n"
+            "Если матч отменится — ничего не спишется.",
             view=view,
             ephemeral=True,
         )
@@ -569,7 +617,7 @@ class DuelCog(commands.Cog):
 
 # ---------------- Views ----------------
 
-class StartDuelView(discord.ui.View):
+class StartDuelView(GuardedView):
     def __init__(self, cog: DuelCog):
         super().__init__(timeout=None)
         self.cog = cog
@@ -578,13 +626,13 @@ class StartDuelView(discord.ui.View):
     async def play(self, interaction: discord.Interaction, _: discord.ui.Button):
         ch = interaction.channel
         if not isinstance(ch, discord.TextChannel):
-            await interaction.response.send_message("⚠️ Канал не найден.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Канал не найден.", ephemeral=True)
             return
-        await interaction.response.send_message("✅ Матч открыт.", ephemeral=True)
+        await safe_send(interaction, "✅ Матч открыт.", ephemeral=True)
         await self.cog.start_lobby(ch, interaction.user)  # type: ignore
 
 
-class LobbyView(discord.ui.View):
+class LobbyView(GuardedView):
     def __init__(self, cog: DuelCog, match: DuelMatch):
         super().__init__(timeout=70)
         self.cog = cog
@@ -613,17 +661,17 @@ class LobbyView(discord.ui.View):
     async def take_pudge(self, interaction: discord.Interaction, _: discord.ui.Button):
         lvl = await self.cog._get_level(interaction.user.id)
         if not can_play_duel(lvl) and not self.cog._is_admin(interaction.user.id):
-            await interaction.response.send_message("⛓️ Тебе ещё рано для дуэли (15+).", ephemeral=True)
+            await safe_send(interaction, "⛓️ Тебе ещё рано для дуэли (15+).", ephemeral=True)
             return
         if self._side_taken("pudge"):
-            await interaction.response.send_message("⚠️ Пудж уже выбран.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Пудж уже выбран.", ephemeral=True)
             return
         if self.match.cm_id == interaction.user.id:
-            await interaction.response.send_message("⚠️ Ты уже ЦМ.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Ты уже ЦМ.", ephemeral=True)
             return
 
         self.match.pudge_id = interaction.user.id
-        await interaction.response.send_message("✅ Ты стал Пуджом.", ephemeral=True, delete_after=10)
+        await safe_send(interaction, "✅ Ты стал Пуджом.", ephemeral=True, delete_after=10)
         msg = interaction.message
         if isinstance(msg, discord.Message):
             await self._refresh_embed(msg)
@@ -636,17 +684,17 @@ class LobbyView(discord.ui.View):
     async def take_cm(self, interaction: discord.Interaction, _: discord.ui.Button):
         lvl = await self.cog._get_level(interaction.user.id)
         if not can_play_duel(lvl) and not self.cog._is_admin(interaction.user.id):
-            await interaction.response.send_message("⛓️ Тебе ещё рано для дуэли (15+).", ephemeral=True)
+            await safe_send(interaction, "⛓️ Тебе ещё рано для дуэли (15+).", ephemeral=True)
             return
         if self._side_taken("cm"):
-            await interaction.response.send_message("⚠️ ЦМ уже выбрана.", ephemeral=True)
+            await safe_send(interaction, "⚠️ ЦМ уже выбрана.", ephemeral=True)
             return
         if self.match.pudge_id == interaction.user.id:
-            await interaction.response.send_message("⚠️ Ты уже Пудж.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Ты уже Пудж.", ephemeral=True)
             return
 
         self.match.cm_id = interaction.user.id
-        await interaction.response.send_message("✅ Ты стал ЦМ.", ephemeral=True, delete_after=10)
+        await safe_send(interaction, "✅ Ты стал ЦМ.", ephemeral=True, delete_after=10)
         msg = interaction.message
         if isinstance(msg, discord.Message):
             await self._refresh_embed(msg)
@@ -658,17 +706,17 @@ class LobbyView(discord.ui.View):
     @discord.ui.button(label="💰 Ставки", style=discord.ButtonStyle.primary)
     async def bets(self, interaction: discord.Interaction, _: discord.ui.Button):
         if self.match.pudge_id is None or self.match.cm_id is None:
-            await interaction.response.send_message("⏳ Сначала выберите обе стороны.", ephemeral=True)
+            await safe_send(interaction, "⏳ Сначала выберите обе стороны.", ephemeral=True)
             return
         await self.cog.open_bet_panel(interaction, self.match)
 
     @discord.ui.button(label="Отменить", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
         if interaction.user.id not in (self.match.pudge_id, self.match.cm_id, self.match.starter_id) and not self.cog._is_admin(interaction.user.id):
-            await interaction.response.send_message("⚠️ Отменить может только инициатор или игроки.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Отменить может только инициатор или игроки.", ephemeral=True)
             return
         self.match.phase = "cancelled"
-        await interaction.response.send_message("⛓️ Матч отменён.", ephemeral=True)
+        await safe_send(interaction, "⛓️ Матч отменён.", ephemeral=True)
         try:
             await interaction.message.delete()
         except Exception:
@@ -676,7 +724,7 @@ class LobbyView(discord.ui.View):
         self.cog.matches.pop(self.match.channel_id, None)
 
 
-class ProposerPickButton(discord.ui.View):
+class ProposerPickButton(GuardedView):
     def __init__(self, cog: DuelCog, match: DuelMatch, proposer_id: int):
         super().__init__(timeout=35)
         self.cog = cog
@@ -686,20 +734,20 @@ class ProposerPickButton(discord.ui.View):
     @discord.ui.button(label="Выбрать ставку", style=discord.ButtonStyle.primary)
     async def pick(self, interaction: discord.Interaction, _: discord.ui.Button):
         if interaction.user.id != self.proposer_id:
-            await interaction.response.send_message("⚠️ Ставку выбирает другой игрок.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Ставку выбирает другой игрок.", ephemeral=True)
             return
 
         lvl = await self.cog._get_level(interaction.user.id)
         opts = stake_options_for_level(lvl)
         if not opts:
-            await interaction.response.send_message("⛓️ Тебе ещё рано для ставок дуэли.", ephemeral=True)
+            await safe_send(interaction, "⛓️ Тебе ещё рано для ставок дуэли.", ephemeral=True)
             return
 
         view = ProposerStakeView(self.cog, self.match, opts)
-        await interaction.response.send_message("Выбери ставку (30 сек):", view=view, ephemeral=True)
+        await safe_send(interaction, "Выбери ставку (30 сек):", view=view, ephemeral=True)
 
 
-class ProposerStakeView(discord.ui.View):
+class ProposerStakeView(GuardedView):
     def __init__(self, cog: DuelCog, match: DuelMatch, options: List[int]):
         super().__init__(timeout=30)
         self.cog = cog
@@ -719,14 +767,14 @@ class ProposerStakeButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if self.match.phase != "stake_pick":
-            await interaction.response.send_message("⚠️ Уже не время выбирать ставку.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Уже не время выбирать ставку.", ephemeral=True)
             return
 
-        await interaction.response.send_message(f"✅ Ставка предложена: {self._stake}.", ephemeral=True, delete_after=10)
+        await safe_send(interaction, f"✅ Ставка предложена: {self._stake}.", ephemeral=True, delete_after=10)
         await self.cog.proposer_set_stake(interaction, self.match, self._stake)
 
 
-class ConfirmStakeView(discord.ui.View):
+class ConfirmStakeView(GuardedView):
     def __init__(self, cog: DuelCog, match: DuelMatch, confirmer_id: int):
         super().__init__(timeout=35)
         self.cog = cog
@@ -736,9 +784,9 @@ class ConfirmStakeView(discord.ui.View):
     @discord.ui.button(label="✅ Принять", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, _: discord.ui.Button):
         if interaction.user.id != self.confirmer_id:
-            await interaction.response.send_message("⚠️ Подтверждает другой игрок.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Подтверждает другой игрок.", ephemeral=True)
             return
-        await interaction.response.send_message("✅ Принято.", ephemeral=True, delete_after=10)
+        await safe_send(interaction, "✅ Принято.", ephemeral=True, delete_after=10)
         ch = interaction.channel
         if isinstance(ch, discord.TextChannel):
             await self.cog.confirm_stake(ch, self.match, True)
@@ -746,15 +794,15 @@ class ConfirmStakeView(discord.ui.View):
     @discord.ui.button(label="❌ Отказаться", style=discord.ButtonStyle.danger)
     async def reject(self, interaction: discord.Interaction, _: discord.ui.Button):
         if interaction.user.id != self.confirmer_id:
-            await interaction.response.send_message("⚠️ Подтверждает другой игрок.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Подтверждает другой игрок.", ephemeral=True)
             return
-        await interaction.response.send_message("⛓️ Отклонено.", ephemeral=True, delete_after=10)
+        await safe_send(interaction, "⛓️ Отклонено.", ephemeral=True, delete_after=10)
         ch = interaction.channel
         if isinstance(ch, discord.TextChannel):
             await self.cog.confirm_stake(ch, self.match, False)
 
 
-class BettorStakeView(discord.ui.View):
+class BettorStakeView(GuardedView):
     def __init__(self, cog: DuelCog, match: DuelMatch, user_id: int, options: List[int]):
         super().__init__(timeout=30)
         self.cog = cog
@@ -769,7 +817,10 @@ class BettorStakeView(discord.ui.View):
         self.add_item(BettorCancelButton())
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id == self.user_id
+        if interaction.user.id != self.user_id:
+            await safe_send(interaction, "⚠️ Это меню не для тебя.", ephemeral=True)
+            return False
+        return True
 
 
 class BettorSideButton(discord.ui.Button):
@@ -780,7 +831,7 @@ class BettorSideButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view: BettorStakeView = self.view  # type: ignore
         view.side = self.side
-        await interaction.response.send_message(f"✅ Сторона выбрана. Теперь ставка.", ephemeral=True, delete_after=10)
+        await safe_send(interaction, f"✅ Сторона выбрана. Теперь ставка.", ephemeral=True, delete_after=10)
 
 
 class BettorStakePickButton(discord.ui.Button):
@@ -794,21 +845,21 @@ class BettorStakePickButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view: BettorStakeView = self.view  # type: ignore
         if view.side not in ("pudge", "cm"):
-            await interaction.response.send_message("⚠️ Сначала выбери сторону.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Сначала выбери сторону.", ephemeral=True)
             return
 
-        repo = getattr(self.cog.bot, "repo", None)
-        if repo is None:
-            await interaction.response.send_message("⚠️ База не подключена.", ephemeral=True)
-            return
-
-        ok = await repo.spend_runes(self.user_id, self.stake)
-        if not ok:
-            await interaction.response.send_message("⛓️ У тебя не хватает рун для этой ставки.", ephemeral=True)
+        can_pay = await self.cog._can_cover_loss(self.user_id, self.stake)
+        if not can_pay:
+            await safe_send(interaction, "⛓️ У тебя не хватает рун для этой ставки.", ephemeral=True)
             return
 
         self.match.bets[self.user_id] = Bet(user_id=self.user_id, side=view.side, stake=self.stake)
-        await interaction.response.send_message(f"✅ Ставка принята.", ephemeral=True, delete_after=10)
+        await safe_send(
+            interaction,
+            "✅ Ставка зафиксирована. Списание/начисление будет только по итогам матча.",
+            ephemeral=True,
+            delete_after=10,
+        )
 
 
 class BettorCancelButton(discord.ui.Button):
@@ -816,10 +867,10 @@ class BettorCancelButton(discord.ui.Button):
         super().__init__(label="Отменить участие", style=discord.ButtonStyle.danger)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message("Ок. Ты не участвуешь.", ephemeral=True, delete_after=10)
+        await safe_send(interaction, "Ок. Ты не участвуешь.", ephemeral=True, delete_after=10)
 
 
-class TurnPickView(discord.ui.View):
+class TurnPickView(GuardedView):
     def __init__(self, cog: DuelCog, match: DuelMatch):
         super().__init__(timeout=35)
         self.cog = cog
@@ -829,7 +880,10 @@ class TurnPickView(discord.ui.View):
         self.add_item(TurnPickButton("Низ", 2))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id in (self.match.pudge_id, self.match.cm_id)
+        if interaction.user.id not in (self.match.pudge_id, self.match.cm_id):
+            await safe_send(interaction, "⚠️ Ты не участник этой дуэли.", ephemeral=True)
+            return False
+        return True
 
 
 class TurnPickButton(discord.ui.Button):
@@ -844,21 +898,21 @@ class TurnPickButton(discord.ui.Button):
         ch = interaction.channel
 
         if not isinstance(ch, discord.TextChannel):
-            await interaction.response.send_message("⚠️ Канал не найден.", ephemeral=True)
+            await safe_send(interaction, "⚠️ Канал не найден.", ephemeral=True)
             return
 
         if interaction.user.id == match.pudge_id:
             side = "pudge"
             if match.hook_row is not None:
-                await interaction.response.send_message("⚠️ Ты уже выбрал ход.", ephemeral=True)
+                await safe_send(interaction, "⚠️ Ты уже выбрал ход.", ephemeral=True)
                 return
         else:
             side = "cm"
             if match.cm_row is not None:
-                await interaction.response.send_message("⚠️ Ты уже выбрала ход.", ephemeral=True)
+                await safe_send(interaction, "⚠️ Ты уже выбрала ход.", ephemeral=True)
                 return
 
-        await interaction.response.send_message("✅ Ход принят.", ephemeral=True, delete_after=10)
+        await safe_send(interaction, "✅ Ход принят.", ephemeral=True, delete_after=10)
         await cog.on_pick(ch, match, side=side, row=self.row)
 
 

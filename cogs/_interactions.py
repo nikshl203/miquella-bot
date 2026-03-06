@@ -39,7 +39,7 @@ async def safe_defer_update(interaction: discord.Interaction) -> bool:
 
 async def safe_send(
     interaction: discord.Interaction,
-    content: str,
+    content: Optional[str] = None,
     *,
     ephemeral: bool = False,
     **kwargs: Any,
@@ -102,3 +102,17 @@ async def safe_edit_message(interaction: discord.Interaction, **kwargs: Any) -> 
     except Exception:
         log.exception("safe_edit_message failed")
         return False
+
+
+class GuardedView(discord.ui.View):
+    """Base View with centralized callback error handling."""
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+        /,
+    ) -> None:
+        log.exception("View callback failed: %s item=%s", type(self).__name__, type(item).__name__)
+        await safe_send(interaction, "⚠️ Ошибка взаимодействия. Попробуй ещё раз.", ephemeral=True)

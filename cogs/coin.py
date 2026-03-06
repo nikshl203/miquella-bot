@@ -1,130 +1,24 @@
-# cogs/coin.py
+﻿# cogs/coin.py
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Tuple
 
-# Import limit helpers from the shared game_limits module. If the module or imports
-# are unavailable, fallback functions will be defined below.
-try:
-    from game_limits import (
-        add_progress as limits_add_progress,
-        can_play as limits_can_play,
-        format_progress as limits_format_progress,
-        get_limit_value as limits_get_limit_value,
-        get_progress as limits_get_progress,
-    )
-except Exception:
-    # fallback definitions if game_limits cannot be imported
-    #
-    # In the absence of the shared limits module, we still want to track and enforce
-    # daily limits using the legacy dp_get/dp_add methods from Repo and the
-    # default caps defined in this cog (DAILY_PROFIT_CAP). These fallback
-    # functions implement that behaviour. They mirror the signatures of the
-    # functions from game_limits so that the rest of this cog can call them
-    # transparently. See issue #XXX for discussion.
-
-    async def limits_add_progress(repo, user_id: int, key: str, amount: int) -> None:
-        """Add progress to the daily counter via dp_add when the limits module is unavailable.
-
-        Parameters
-        ----------
-        repo: Repo
-            The database repository object providing dp_add().
-        user_id: int
-            The Discord user ID.
-        key: str
-            The limit key (e.g. 'coin:easy').
-        amount: int
-            Amount of profit to record. Negative or zero amounts are ignored.
-        """
-        amt = int(amount)
-        if amt <= 0:
-            return
-        # Use Repo.dp_add to increment the daily_profit table directly
-        dp_add = getattr(repo, "dp_add", None)
-        if callable(dp_add):
-            try:
-                day = msk_day_key()
-                await dp_add(user_id, day, key, amt)
-            except Exception:
-                # swallow exceptions silently to match behaviour of the imported
-                # limits module
-                pass
-        return
-
-    async def limits_get_progress(repo, user_id: int, key: str) -> int:
-        """Get current progress from the daily_profit table via dp_get.
-
-        Returns
-        -------
-        int
-            Current recorded progress for this user and key, or 0 if unavailable.
-        """
-        dp_get = getattr(repo, "dp_get", None)
-        if callable(dp_get):
-            try:
-                day = msk_day_key()
-                return int(await dp_get(user_id, day, key))
-            except Exception:
-                return 0
-        return 0
-
-    def limits_get_limit_value(key: str) -> int:
-        """Return the default cap for a given limit key.
-
-        The key is expected to be in the form '<namespace>:<diff>', e.g. 'coin:easy'.
-        If the namespace is 'coin', we look up the cap in DAILY_PROFIT_CAP. Unknown
-        keys return 0.
-        """
-        try:
-            # Extract the difficulty part (after the colon) and look up cap
-            ns, diff_key = key.split(":", 1)
-        except ValueError:
-            diff_key = key
-        return int(DAILY_PROFIT_CAP.get(diff_key, 0))
-
-    async def limits_format_progress(repo, user_id: int, key: str) -> str:
-        """Format progress for display using fallback methods.
-
-        Returns a string of the form 'current/cap'. Unknown keys produce '0/0'.
-        """
-        have = await limits_get_progress(repo, user_id, key)
-        cap = limits_get_limit_value(key)
-        return f"{have}/{cap}"
-
-    async def limits_can_play(repo, user_id: int, key: str, expected_gain: int = 0):
-        """Check if the user is allowed to play under the fallback limit system.
-
-        Implements the same overshoot-allowed logic as the real limits module. If
-        the default cap is zero (unknown), always allow.
-
-        Returns
-        -------
-        tuple[bool, int, int]
-            A tuple of (allowed, current, limit).
-        """
-        cap = limits_get_limit_value(key)
-        if cap <= 0:
-            return True, 0, 0
-        current = await limits_get_progress(repo, user_id, key)
-        # allow if not yet at cap
-        if current < cap:
-            return True, current, cap
-        # allow if the expected gain overshoots the cap but player hasn't yet
-        # reached the total of cap + expected_gain
-        if expected_gain > 0 and current < cap + expected_gain:
-            return True, current, cap
-        return False, current, cap
-
 import discord
 from discord.ext import commands
+
+from ._interactions import GuardedView, safe_defer_ephemeral, safe_edit_message, safe_send
+from game_limits import add_progress as limits_add_progress
+from game_limits import get_progress as limits_get_progress
+from time_utils import msk_day_key
+
+log = logging.getLogger("void.coin")
 
 # --- paths ---
 ROOT = Path(__file__).resolve().parents[1]
@@ -157,11 +51,6 @@ FEE_RATE = 0.05  # 5% (ceil), min 1 if profit > 0
 
 SIDE_NAME = {"heads": "Орёл", "tails": "Решка"}
 
-
-def msk_day_key() -> str:
-    # MSK = UTC+3, no DST
-    dt = datetime.now(timezone.utc) + timedelta(hours=3)
-    return dt.strftime("%Y-%m-%d")
 
 
 def fee_from_profit(profit: int) -> int:
@@ -250,47 +139,129 @@ class CoinCog(commands.Cog):
     async def cd_key(self, diff_key: str) -> str:
         return f"coin:{diff_key}"
 
-    async def daily_progress(self, user_id: int) -> Dict[str, Tuple[int, int]]:
-        """
-        Return current progress and cap values for each coin difficulty for the given user.
+    def _limit_db_key(self, diff_key: str) -> str:
+        return f"coin:{diff_key}"
 
-        This method attempts to use the shared limits module to retrieve the user's
-        progress and the configured cap. If the limits module is not available,
-        it falls back to the legacy behaviour using ``DAILY_PROFIT_CAP`` and
-        ``Repo.dp_get``.
+    async def _limit_get(self, user_id: int, diff_key: str) -> int:
+        day = msk_day_key()
+        key = self._limit_db_key(diff_key)
 
-        Parameters
-        ----------
-        user_id: int
-            Discord user ID for whom to fetch progress.
+        # Main path through shared limits module.
+        try:
+            return int(await limits_get_progress(self.repo, user_id, key))
+        except Exception:
+            log.exception("coin limit read failed via game_limits user=%s diff=%s", user_id, diff_key)
 
-        Returns
-        -------
-        dict[str, tuple[int, int]]
-            Mapping of difficulty keys ("easy", "mid", "hard") to a pair
-            ``(current, cap)``.
-        """
-        out: Dict[str, Tuple[int, int]] = {}
-        for k, default_cap in DAILY_PROFIT_CAP.items():
-            limit_key = f"coin:{k}"
-            # Try to use limits module functions
+        # Fallback path via repo helper.
+        dp_get = getattr(self.repo, "dp_get", None)
+        if callable(dp_get):
             try:
-                have = int(await limits_get_progress(self.repo, user_id, limit_key))
-                cap = limits_get_limit_value(limit_key)
+                return int(await dp_get(user_id, day, key))
             except Exception:
-                # fallback to legacy logic
-                cap = default_cap
-                day = msk_day_key()
-                dp_get = getattr(self.repo, "dp_get", None)
-                have = 0
-                if callable(dp_get):
-                    try:
-                        have = int(await dp_get(user_id, day, limit_key))
-                    except Exception:
-                        have = 0
-            # If the cap returned from the limits module is zero or negative, fall back to the default cap
-            if cap is None or cap <= 0:
-                cap = default_cap
+                log.exception("coin limit read failed via repo helper user=%s diff=%s", user_id, diff_key)
+
+        # Fallback path: read directly from DB connection.
+        conn = getattr(self.repo, "conn", None)
+        if conn is None:
+            return 0
+        try:
+            cur = await conn.execute("PRAGMA table_info(daily_profit)")
+            rows = await cur.fetchall()
+            await cur.close()
+            cols = {str(r[1]) for r in rows}
+            amount_col = "value" if "value" in cols else ("amount" if "amount" in cols else "value")
+
+            cur = await conn.execute(
+                f"SELECT COALESCE(SUM({amount_col}), 0) FROM daily_profit WHERE user_id=? AND day_key=? AND key=?",
+                (int(user_id), str(day), str(key)),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            return int(row[0] or 0) if row else 0
+        except Exception:
+            log.exception("coin limit read failed via direct SQL user=%s diff=%s", user_id, diff_key)
+            return 0
+
+    async def _limit_add(self, user_id: int, diff_key: str, delta: int) -> bool:
+        delta_i = int(delta)
+        if delta_i <= 0:
+            return False
+
+        day = msk_day_key()
+        key = self._limit_db_key(diff_key)
+
+        # Main path through shared limits module.
+        try:
+            await limits_add_progress(self.repo, user_id, key, delta_i)
+            return True
+        except Exception:
+            log.exception(
+                "coin limit write failed via game_limits user=%s diff=%s delta=%s",
+                user_id,
+                diff_key,
+                delta_i,
+            )
+
+        # Fallback path via repo helper.
+        dp_add = getattr(self.repo, "dp_add", None)
+        if callable(dp_add):
+            try:
+                await dp_add(user_id, day, key, delta_i)
+                return True
+            except Exception:
+                log.exception(
+                    "coin limit write failed via repo helper user=%s diff=%s delta=%s",
+                    user_id,
+                    diff_key,
+                    delta_i,
+                )
+
+        # Fallback path: write directly to DB connection.
+        conn = getattr(self.repo, "conn", None)
+        if conn is None:
+            return False
+
+        amount_col = "value"
+        try:
+            cur = await conn.execute("PRAGMA table_info(daily_profit)")
+            rows = await cur.fetchall()
+            await cur.close()
+            cols = {str(r[1]) for r in rows}
+            amount_col = "value" if "value" in cols else ("amount" if "amount" in cols else "value")
+
+            await conn.execute(
+                """
+                INSERT INTO daily_profit(user_id, day_key, key, {amount_col})
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(user_id, day_key, key) DO UPDATE SET {amount_col} = {amount_col} + excluded.{amount_col}
+                """.format(amount_col=amount_col),
+                (int(user_id), str(day), str(key), delta_i),
+            )
+            await conn.commit()
+            return True
+        except Exception:
+            try:
+                cur = await conn.execute(
+                    f"UPDATE daily_profit SET {amount_col} = {amount_col} + ? WHERE user_id=? AND day_key=? AND key=?",
+                    (delta_i, int(user_id), str(day), str(key)),
+                )
+                changed = int(cur.rowcount or 0)
+                await cur.close()
+                if changed == 0:
+                    await conn.execute(
+                        f"INSERT INTO daily_profit(user_id, day_key, key, {amount_col}) VALUES(?, ?, ?, ?)",
+                        (int(user_id), str(day), str(key), delta_i),
+                    )
+                await conn.commit()
+                return True
+            except Exception:
+                log.exception("coin limit write failed via direct SQL user=%s diff=%s delta=%s", user_id, diff_key, delta_i)
+                return False
+
+    async def daily_progress(self, user_id: int) -> Dict[str, Tuple[int, int]]:
+        out: Dict[str, Tuple[int, int]] = {}
+        for k, cap in DAILY_PROFIT_CAP.items():
+            have = await self._limit_get(user_id, k)
             out[k] = (have, cap)
         return out
 
@@ -299,49 +270,32 @@ class CoinCog(commands.Cog):
         if (not self.is_admin(user_id)) and lvl < diff.unlock_level:
             return False, lore_too_early()
 
-        until = await self.repo.cd_get(user_id, await self.cd_key(diff.key))
-        now = int(time.time())
-        if until > now:
-            if diff.key == "cursed":
-                return False, lore_cursed_cd()
-            left = max(1, (until - now) // 60)
-            return False, f"Пустота просит паузу. Вернись через ~{left} мин."
+        if not self.is_admin(user_id):
+            until = await self.repo.cd_get(user_id, await self.cd_key(diff.key))
+            now = int(time.time())
+            if until > now:
+                if diff.key == "cursed":
+                    return False, lore_cursed_cd()
+                left = max(1, (until - now) // 60)
+                return False, f"Пустота просит паузу. Вернись через ~{left} мин."
 
-        # Daily profit limit check using the shared limits module. Cursed games
-        # have no limit, and admins bypass the limit.
+        # Daily profit limit check. Cursed games have no limit, and admins bypass the limit.
         if diff.key != "cursed" and not self.is_admin(user_id):
-            limit_key = f"coin:{diff.key}"
-            try:
-                allowed, have, cap = await limits_can_play(self.repo, user_id, limit_key, expected_gain=0)
-            except Exception:
-                # fallback to legacy behaviour if limits module fails
-                cap = DAILY_PROFIT_CAP.get(diff.key)
-                allowed = True
-                have = 0
-                if cap is not None:
-                    day = msk_day_key()
-                    dp_get = getattr(self.repo, "dp_get", None)
-                    if callable(dp_get):
-                        try:
-                            have = int(await dp_get(user_id, day, limit_key))
-                        except Exception:
-                            have = 0
-                    allowed = have < cap
-            if cap is not None and not allowed:
-                # Build progress string for message
-                try:
-                    progress_str = await limits_format_progress(self.repo, user_id, limit_key)
-                except Exception:
-                    progress_str = f"{have}/{cap}"
-                msg = (
-                    f"Печать Пустоты на сегодня закрыта: **{progress_str}** чистой удачи.\n"
-                    "Вернись завтра (по МСК) или выбери другую сложность."
-                )
-                return False, msg
+            cap = DAILY_PROFIT_CAP.get(diff.key)
+            if cap is not None:
+                have = await self._limit_get(user_id, diff.key)
+                if have >= cap:
+                    msg = (
+                        f"Печать Пустоты на сегодня закрыта: **{have}/{cap}** чистой удачи.\n"
+                        "Вернись завтра (по МСК) или выбери другую сложность."
+                    )
+                    return False, msg
 
         return True, ""
 
     async def set_cd(self, user_id: int, diff: Diff) -> None:
+        if self.is_admin(user_id):
+            return
         await self.repo.cd_set(user_id, await self.cd_key(diff.key), diff.cd_seconds)
 
     async def post_public_result(
@@ -385,23 +339,18 @@ class CoinCog(commands.Cog):
         await ch.send(embed=embed)
 
     async def begin(self, interaction: discord.Interaction) -> None:
-        # Avoid Unknown interaction
-        try:
-            await interaction.response.defer(ephemeral=True, thinking=False)
-        except Exception:
-            pass
+        # Ack early to avoid Unknown interaction on slower paths.
+        await safe_defer_ephemeral(interaction)
 
         prog = await self.daily_progress(interaction.user.id)
         view = DifficultyView(self, interaction.user.id, prog)
-        try:
-            await interaction.followup.send(
-                content="**Выбор судьбы открыт.**",
-                embed=view.make_embed(),
-                view=view,
-                ephemeral=True,
-            )
-        except discord.NotFound:
-            return
+        await safe_send(
+            interaction,
+            "**Выбор судьбы открыт.**",
+            embed=view.make_embed(),
+            view=view,
+            ephemeral=True,
+        )
 
     async def go_spin_and_resolve(self, interaction: discord.Interaction, diff: Diff, bet: int, side: str) -> None:
         user_id = interaction.user.id
@@ -410,7 +359,7 @@ class CoinCog(commands.Cog):
         if diff.key != "cursed":
             ok = await self.repo.spend_runes(user_id, bet)
             if not ok:
-                await interaction.response.send_message(lore_no_runes(), ephemeral=True)
+                await safe_send(interaction, lore_no_runes(), ephemeral=True)
                 return
 
         await self.set_cd(user_id, diff)
@@ -435,10 +384,7 @@ class CoinCog(commands.Cog):
             reward = round_up_int(bet * diff.mult) if win else 0
 
         # Show spin
-        try:
-            await interaction.response.defer(ephemeral=True, thinking=False)
-        except Exception:
-            pass
+        await safe_defer_ephemeral(interaction)
 
         spin_embed = discord.Embed(title="Монета вращается…", description=pre_spin_phrase())
         spin_files = []
@@ -460,6 +406,7 @@ class CoinCog(commands.Cog):
 
         # Final embed
         result_embed = discord.Embed(title=f"🪙 Монетка — {'ПОБЕДА' if win else 'ПОРАЖЕНИЕ'}")
+        
         result_embed.add_field(name="Сложность", value=f"{diff.title} ({int(diff.win_chance*100)}%)", inline=True)
         result_embed.add_field(name="Ставка", value=str(bet if diff.key != "cursed" else 0), inline=True)
         result_embed.add_field(name="Твоя сторона", value=SIDE_NAME[side], inline=True)
@@ -497,43 +444,15 @@ class CoinCog(commands.Cog):
                 await self.repo.add_runes(user_id, int(bet) + int(net))
                 # update limit progress for coin games when net > 0
                 if net > 0:
-                    try:
-                        await limits_add_progress(self.repo, user_id, f"coin:{diff.key}", int(net))
-                    except Exception:
-                        # fallback to legacy dp_add if limits module is not available
-                        dp_add = getattr(self.repo, "dp_add", None)
-                        if callable(dp_add):
-                            try:
-                                await dp_add(user_id, msk_day_key(), f"coin:{diff.key}", int(net))
-                            except Exception:
-                                pass
+                    await self._limit_add(user_id, diff.key, int(net))
 
-        # Before sending the final embed, append the updated limit progress field for non-cursed games.
+        # Append the updated limit progress field for non-cursed games.
         if diff.key != "cursed":
-            try:
-                progress_str = await limits_format_progress(self.repo, user_id, f"coin:{diff.key}")
-                # If the limits module returns a cap of zero, fall back to default cap values
-                curr, cap = progress_str.split("/") if "/" in progress_str else ("0", "0")
-                if int(cap) <= 0:
-                    raise ValueError
-            except Exception:
-                # fallback to manual computation if limits module fails or returns zero cap
-                cap = DAILY_PROFIT_CAP.get(diff.key)
-                if cap is not None:
-                    day = msk_day_key()
-                    dp_get = getattr(self.repo, "dp_get", None)
-                    have = 0
-                    if callable(dp_get):
-                        try:
-                            have = int(await dp_get(user_id, day, f"coin:{diff.key}"))
-                        except Exception:
-                            have = 0
-                    progress_str = f"{have}/{cap}"
-                else:
-                    progress_str = "0/0"
+            cap = DAILY_PROFIT_CAP.get(diff.key, 0)
+            have = await self._limit_get(user_id, diff.key)
             result_embed.add_field(
                 name="Лимит прибыли (сегодня)",
-                value=progress_str,
+                value=f"{have}/{cap}",
                 inline=True,
             )
 
@@ -603,7 +522,7 @@ def _daily_income_from_cfg(cfg: dict, level: int) -> int:
 
 
 # ---------------- Views ----------------
-class StartView(discord.ui.View):
+class StartView(GuardedView):
     def __init__(self, cog: CoinCog):
         super().__init__(timeout=None)
         self.cog = cog
@@ -613,7 +532,7 @@ class StartView(discord.ui.View):
         await self.cog.begin(interaction)
 
 
-class DifficultyView(discord.ui.View):
+class DifficultyView(GuardedView):
     def __init__(self, cog: CoinCog, user_id: int, progress: Dict[str, Tuple[int, int]]):
         super().__init__(timeout=120)
         self.cog = cog
@@ -650,11 +569,12 @@ class DifficultyView(discord.ui.View):
             ).format(easy_have, easy_cap, mid_have, mid_cap, hard_have, hard_cap),
             inline=False,
         )
+        
         return e
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Это не твой бросок.", ephemeral=True)
+            await safe_send(interaction, "Это не твой бросок.", ephemeral=True)
             return False
         return True
 
@@ -668,19 +588,19 @@ class DiffButton(discord.ui.Button):
         view: DifficultyView = self.view  # type: ignore
         ok, why = await view.cog.can_play(interaction.user.id, self.diff)
         if not ok:
-            await interaction.response.send_message(why, ephemeral=True)
+            await safe_send(interaction, why, ephemeral=True)
             return
 
         if self.diff.key == "cursed":
             sv = SideView(view.cog, interaction.user.id, self.diff, bet=0)
-            await interaction.response.edit_message(embed=sv.make_embed(), view=sv)
+            await safe_edit_message(interaction, embed=sv.make_embed(), view=sv)
             return
 
         bv = BetView(view.cog, interaction.user.id, self.diff)
-        await interaction.response.edit_message(embed=bv.make_embed(), view=bv)
+        await safe_edit_message(interaction, embed=bv.make_embed(), view=bv)
 
 
-class BetView(discord.ui.View):
+class BetView(GuardedView):
     def __init__(self, cog: CoinCog, user_id: int, diff: Diff):
         super().__init__(timeout=120)
         self.cog = cog
@@ -702,7 +622,7 @@ class BetView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Это не твой бросок.", ephemeral=True)
+            await safe_send(interaction, "Это не твой бросок.", ephemeral=True)
             return False
         return True
 
@@ -716,14 +636,14 @@ class BetButton(discord.ui.Button):
         view: BetView = self.view  # type: ignore
         u = await view.cog.repo.get_user(interaction.user.id)
         if int(u.get("runes", 0)) < self.bet and not view.cog.is_admin(interaction.user.id):
-            await interaction.response.send_message(lore_no_runes(), ephemeral=True)
+            await safe_send(interaction, lore_no_runes(), ephemeral=True)
             return
 
         sv = SideView(view.cog, interaction.user.id, view.diff, bet=self.bet)
-        await interaction.response.edit_message(embed=sv.make_embed(), view=sv)
+        await safe_edit_message(interaction, embed=sv.make_embed(), view=sv)
 
 
-class SideView(discord.ui.View):
+class SideView(GuardedView):
     def __init__(self, cog: CoinCog, user_id: int, diff: Diff, bet: int):
         super().__init__(timeout=120)
         self.cog = cog
@@ -749,7 +669,7 @@ class SideView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Это не твой бросок.", ephemeral=True)
+            await safe_send(interaction, "Это не твой бросок.", ephemeral=True)
             return False
         return True
 
@@ -766,7 +686,7 @@ class SideButton(discord.ui.Button):
         view: SideView = self.view  # type: ignore
         ok, why = await view.cog.can_play(interaction.user.id, view.diff)
         if not ok:
-            await interaction.response.send_message(why, ephemeral=True)
+            await safe_send(interaction, why, ephemeral=True)
             return
         await view.cog.go_spin_and_resolve(interaction, view.diff, view.bet, self.side)
 
@@ -778,13 +698,10 @@ class BackButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view = self.view  # type: ignore
         cog: CoinCog = view.cog  # type: ignore
-        try:
-            await interaction.response.defer(ephemeral=True, thinking=False)
-        except Exception:
-            pass
+        await safe_defer_ephemeral(interaction)
         prog = await cog.daily_progress(interaction.user.id)
         dv = DifficultyView(cog, interaction.user.id, prog)
-        await interaction.edit_original_response(embed=dv.make_embed(), view=dv)
+        await safe_edit_message(interaction, embed=dv.make_embed(), view=dv)
 
 
 class CancelButton(discord.ui.Button):
@@ -792,8 +709,11 @@ class CancelButton(discord.ui.Button):
         super().__init__(label="Отменить", style=discord.ButtonStyle.danger)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(content="Отменено.", embed=None, view=None)
+        await safe_edit_message(interaction, content="Отменено.", embed=None, view=None)
 
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(CoinCog(bot))
+
+
+

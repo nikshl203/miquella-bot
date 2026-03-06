@@ -1,4 +1,4 @@
-# cogs/db.py
+﻿# cogs/db.py
 from __future__ import annotations
 
 import logging
@@ -30,6 +30,7 @@ def _gen_code(n: int = 10) -> str:
 class Repo:
     def __init__(self) -> None:
         self.conn: aiosqlite.Connection | None = None
+        self._daily_profit_col_cache: str | None = None
 
     async def connect(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,6 +43,7 @@ class Repo:
         await self.conn.execute("PRAGMA busy_timeout=5000;")
         await self._create_tables()
         await self._migrate_schema()
+        self._daily_profit_col_cache = None
         await self.conn.commit()
 
         log.info("DB ready: %s", DB_PATH)
@@ -151,6 +153,19 @@ CREATE TABLE IF NOT EXISTS tendrils(
         await cur.close()
         return {str(r[1]) for r in rows}  # r[1] = column name
 
+    async def _daily_profit_col(self) -> str:
+        """Return the active numeric column name for daily_profit counters."""
+        if self._daily_profit_col_cache:
+            return self._daily_profit_col_cache
+        cols = await self._table_cols("daily_profit")
+        if "value" in cols:
+            self._daily_profit_col_cache = "value"
+        elif "amount" in cols:
+            self._daily_profit_col_cache = "amount"
+        else:
+            self._daily_profit_col_cache = "value"
+        return self._daily_profit_col_cache
+
     async def _migrate_schema(self) -> None:
         """Idempotent migrations for older DBs."""
         assert self.conn
@@ -171,6 +186,23 @@ CREATE TABLE IF NOT EXISTS tendrils(
         if "kind" not in ccols:
             await self.conn.execute(
                 "ALTER TABLE codes ADD COLUMN kind TEXT NOT NULL DEFAULT ''"
+            )
+
+        # ---- daily_profit: legacy column name compatibility ----
+        # Older DBs used `amount` instead of `value`.
+        dpcols = await self._table_cols("daily_profit")
+        if "value" not in dpcols and "amount" in dpcols:
+            await self.conn.execute(
+                "ALTER TABLE daily_profit ADD COLUMN value INTEGER NOT NULL DEFAULT 0"
+            )
+            # Backfill existing counters from legacy column once.
+            await self.conn.execute(
+                "UPDATE daily_profit SET value = amount WHERE value = 0"
+            )
+        elif "value" not in dpcols and "amount" not in dpcols:
+            # Defensive fallback for malformed schemas.
+            await self.conn.execute(
+                "ALTER TABLE daily_profit ADD COLUMN value INTEGER NOT NULL DEFAULT 0"
             )
 
     # ---------- Users ----------
@@ -266,7 +298,7 @@ CREATE TABLE IF NOT EXISTS tendrils(
         await self.ensure_user(user_id)
 
         cost_i = int(cost)
-        # атомарно: UPDATE с условием по балансу, чтобы избежать гонок при одновременных кликах
+        # Атомарно: UPDATE с условием по балансу, чтобы избежать гонок при одновременных кликах.
         cur = await self.conn.execute(
             "UPDATE users SET runes = runes - ? WHERE user_id=? AND runes >= ?",
             (cost_i, int(user_id), cost_i),
@@ -284,8 +316,9 @@ CREATE TABLE IF NOT EXISTS tendrils(
         """Get daily counter value (defaults to 0)."""
         assert self.conn
         await self.ensure_user(user_id)
+        col = await self._daily_profit_col()
         cur = await self.conn.execute(
-            "SELECT value FROM daily_profit WHERE user_id=? AND day_key=? AND key=?",
+            f"SELECT COALESCE(SUM({col}), 0) FROM daily_profit WHERE user_id=? AND day_key=? AND key=?",
             (int(user_id), str(day_key), str(key)),
         )
         row = await cur.fetchone()
@@ -296,15 +329,34 @@ CREATE TABLE IF NOT EXISTS tendrils(
         """Add delta to daily counter (upsert)."""
         assert self.conn
         await self.ensure_user(user_id)
+        col = await self._daily_profit_col()
         delta_i = int(delta)
-        await self.conn.execute(
-            """
-            INSERT INTO daily_profit(user_id, day_key, key, value)
-            VALUES(?, ?, ?, ?)
-            ON CONFLICT(user_id, day_key, key) DO UPDATE SET value = value + excluded.value
-            """,
-            (int(user_id), str(day_key), str(key), delta_i),
-        )
+        uid = int(user_id)
+        dkey = str(day_key)
+        metric = str(key)
+        try:
+            await self.conn.execute(
+                """
+                INSERT INTO daily_profit(user_id, day_key, key, {col})
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(user_id, day_key, key) DO UPDATE SET {col} = {col} + excluded.{col}
+                """.format(col=col),
+                (uid, dkey, metric, delta_i),
+            )
+        except aiosqlite.OperationalError:
+            # Legacy DB fallback: old daily_profit tables might not have the unique
+            # constraint required by ON CONFLICT.
+            cur = await self.conn.execute(
+                f"UPDATE daily_profit SET {col} = {col} + ? WHERE user_id=? AND day_key=? AND key=?",
+                (delta_i, uid, dkey, metric),
+            )
+            updated = int(cur.rowcount or 0)
+            await cur.close()
+            if updated == 0:
+                await self.conn.execute(
+                    f"INSERT INTO daily_profit(user_id, day_key, key, {col}) VALUES(?, ?, ?, ?)",
+                    (uid, dkey, metric, delta_i),
+                )
         await self.conn.commit()
 
 # ---------- Cooldowns ----------

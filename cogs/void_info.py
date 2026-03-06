@@ -1,4 +1,4 @@
-# =========================
+﻿# =========================
 # FILE: cogs/void_info.py
 # =========================
 from __future__ import annotations
@@ -11,6 +11,8 @@ from typing import Any, Optional, Tuple
 
 import discord
 from discord.ext import commands
+
+from ._interactions import GuardedView, safe_edit_message, safe_send
 
 
 def _is_admin(bot: commands.Bot, user_id: int) -> bool:
@@ -228,7 +230,7 @@ def _voice_mode_now(bot: commands.Bot, member: discord.Member) -> str:
     return f"соло ({int(round(solo_mult*100))}%)"
 
 
-class VoidInfoView(discord.ui.View):
+class VoidInfoView(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)  # persistent
         self.bot = bot
@@ -330,7 +332,7 @@ class VoidInfoView(discord.ui.View):
             pass
 
 
-class LeaderboardView(discord.ui.View):
+class LeaderboardView(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)  # persistent
         self.bot = bot

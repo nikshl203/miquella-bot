@@ -1,4 +1,4 @@
-# cogs/story.py
+﻿# cogs/story.py
 from __future__ import annotations
 
 import json
@@ -9,6 +9,8 @@ from typing import Any, Dict
 
 import discord
 from discord.ext import commands
+
+from ._interactions import GuardedView, safe_defer_ephemeral, safe_defer_update, safe_edit_message, safe_send
 
 log = logging.getLogger("void")
 
@@ -191,7 +193,7 @@ async def _get_or_create_story_thread(bot: commands.Bot, member: discord.Member)
 
 # ---------------- Order Hall Panel ----------------
 
-class OrderHallView(discord.ui.View):
+class OrderHallView(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
         self.bot = bot
@@ -248,14 +250,14 @@ async def orderhall_issue_code(bot: commands.Bot, interaction: discord.Interacti
     chapters = cfg.get("story", {}).get("chapters", [])
     ch_cfg = next((c for c in chapters if int(c.get("id", 0)) == chapter_id), None)
     if not ch_cfg:
-        await interaction.response.send_message("Глава не настроена в config.json.", ephemeral=True)
+        await safe_send(interaction, "Глава не настроена в config.json.", ephemeral=True)
         return
 
     req_lvl = int(ch_cfg.get("required_level", 0))
     title = str(ch_cfg.get("title", f"Глава {chapter_id}"))
 
     if lvl < req_lvl:
-        await interaction.response.send_message("🕯️ Тебе ещё рано. Порог не узнаёт твой шаг.", ephemeral=True)
+        await safe_send(interaction, "🕯️ Тебе ещё рано. Порог не узнаёт твой шаг.", ephemeral=True)
         await _dm(member, f"🕯️ **{title}**\nПока рано: нужен уровень **{req_lvl}**.")
         return
 
@@ -263,7 +265,7 @@ async def orderhall_issue_code(bot: commands.Bot, interaction: discord.Interacti
     completed = int(st["chapter_completed"])
 
     if completed >= chapter_id:
-        await interaction.response.send_message("🕯️ Эта дверь уже открыта. Проверь тред истории.", ephemeral=True)
+        await safe_send(interaction, "🕯️ Эта дверь уже открыта. Проверь тред истории.", ephemeral=True)
         await _dm(member, f"🕯️ **{title}**\nТы уже открыл эту дверь. Проверь свой тред истории.")
         return
 
@@ -273,7 +275,7 @@ async def orderhall_issue_code(bot: commands.Bot, interaction: discord.Interacti
         if prev_role and member.guild:
             role = member.guild.get_role(prev_role)
             if role and role not in member.roles:
-                await interaction.response.send_message("🕯️ Тебя не признают без печати прошлой главы.", ephemeral=True)
+                await safe_send(interaction, "🕯️ Тебя не признают без печати прошлой главы.", ephemeral=True)
                 await _dm(member, f"🕯️ **{title}**\nНужна печать прошлой главы (роль) + уровень.")
                 return
 
@@ -290,13 +292,13 @@ async def orderhall_issue_code(bot: commands.Bot, interaction: discord.Interacti
 
     ok = await _dm(member, msg)
     if not ok:
-        await interaction.response.send_message(
+        await safe_send(interaction, 
             "Не смог отправить ЛС. Открой личные сообщения от участников сервера и нажми ещё раз.",
             ephemeral=True,
         )
         return
 
-    await interaction.response.send_message("🕯️ Ключ отправлен тебе в ЛС.", ephemeral=True)
+    await safe_send(interaction, "🕯️ Ключ отправлен тебе в ЛС.", ephemeral=True)
 
 
 async def orderhall_replay_current(bot: commands.Bot, interaction: discord.Interaction) -> None:
@@ -308,14 +310,14 @@ async def orderhall_replay_current(bot: commands.Bot, interaction: discord.Inter
     st = await repo.get_story(member.id)
     completed = int(st["chapter_completed"])
     if completed <= 0:
-        await interaction.response.send_message("🕯️ Тебе нечего перепроходить.", ephemeral=True)
+        await safe_send(interaction, "🕯️ Тебе нечего перепроходить.", ephemeral=True)
         return
 
     current = completed
     chapters = cfg.get("story", {}).get("chapters", [])
     ch_cfg = next((c for c in chapters if int(c.get("id", 0)) == current), None)
     if not ch_cfg:
-        await interaction.response.send_message("Глава для перепрохождения не настроена.", ephemeral=True)
+        await safe_send(interaction, "Глава для перепрохождения не настроена.", ephemeral=True)
         return
 
     reward_role_id = int(ch_cfg.get("reward_role_id", 0))
@@ -339,10 +341,10 @@ async def orderhall_replay_current(bot: commands.Bot, interaction: discord.Inter
         f"До успешного прохождения печать (роль) снята.",
     )
     if not ok:
-        await interaction.response.send_message("Не смог отправить ЛС (закрыты личные).", ephemeral=True)
+        await safe_send(interaction, "Не смог отправить ЛС (закрыты личные).", ephemeral=True)
         return
 
-    await interaction.response.send_message("🕯️ Инструкция на перепрохождение отправлена в ЛС.", ephemeral=True)
+    await safe_send(interaction, "🕯️ Инструкция на перепрохождение отправлена в ЛС.", ephemeral=True)
 
 
 # ---------------- Door of Secrets: code entry ----------------
@@ -465,7 +467,7 @@ class StoryCog(commands.Cog):
 
 # ---------------- Chapter 1 ----------------
 
-class Ch1Scene1View(discord.ui.View):
+class Ch1Scene1View(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
         self.bot = bot
@@ -514,13 +516,13 @@ async def ch1_apply_scene1(bot: commands.Bot, interaction: discord.Interaction, 
         att.trust_delta -= 1
 
     await _save_attempt(bot, interaction.user.id, att)
-    await interaction.response.send_message("🕯️ Пустота делает пометку в реестре.", ephemeral=True)
+    await safe_send(interaction, "🕯️ Пустота делает пометку в реестре.", ephemeral=True)
 
     if isinstance(interaction.channel, discord.Thread):
         await send_ch1_scene_2(bot, interaction.channel, interaction.user.id)
 
 
-class Ch1Scene2View(discord.ui.View):
+class Ch1Scene2View(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
         self.bot = bot
@@ -570,13 +572,13 @@ async def ch1_apply_scene2(bot: commands.Bot, interaction: discord.Interaction, 
         att.trust_delta -= 1
 
     await _save_attempt(bot, interaction.user.id, att)
-    await interaction.response.send_message("🕯️ Отметка внесена.", ephemeral=True)
+    await safe_send(interaction, "🕯️ Отметка внесена.", ephemeral=True)
 
     if isinstance(interaction.channel, discord.Thread):
         await send_ch1_scene_3(bot, interaction.channel, interaction.user.id)
 
 
-class Ch1Scene3View(discord.ui.View):
+class Ch1Scene3View(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
         self.bot = bot
@@ -628,7 +630,7 @@ async def ch1_apply_scene3(bot: commands.Bot, interaction: discord.Interaction, 
     await _save_attempt(bot, interaction.user.id, att)
 
     if not isinstance(interaction.channel, discord.Thread):
-        await interaction.response.send_message("Ошибка: история должна идти в треде.", ephemeral=True)
+        await safe_send(interaction, "Ошибка: история должна идти в треде.", ephemeral=True)
         return
 
     if choice == 1:
@@ -664,11 +666,11 @@ async def ch1_apply_scene3(bot: commands.Bot, interaction: discord.Interaction, 
         )
 
     await interaction.channel.send(branch)
-    await interaction.response.send_message("🕯️ Дальше.", ephemeral=True)
+    await safe_send(interaction, "🕯️ Дальше.", ephemeral=True)
     await send_ch1_scene_4(bot, interaction.channel, interaction.user.id)
 
 
-class Ch1Scene4View(discord.ui.View):
+class Ch1Scene4View(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
         self.bot = bot
@@ -721,13 +723,13 @@ async def ch1_apply_scene4(bot: commands.Bot, interaction: discord.Interaction, 
         att.rher_seed = 1
 
     await _save_attempt(bot, interaction.user.id, att)
-    await interaction.response.send_message("🕯️ Пустота молчит дольше, чем нужно.", ephemeral=True)
+    await safe_send(interaction, "🕯️ Пустота молчит дольше, чем нужно.", ephemeral=True)
 
     if isinstance(interaction.channel, discord.Thread):
         await send_ch1_scene_5(bot, interaction.channel, interaction.user.id)
 
 
-class Ch1Scene5View(discord.ui.View):
+class Ch1Scene5View(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
         self.bot = bot
@@ -839,7 +841,7 @@ async def ch1_apply_scene5(bot: commands.Bot, interaction: discord.Interaction, 
                     f"Вставь его в **#дверь-тайн**."
                 )
 
-        await interaction.response.send_message("✅ Глава 1 пройдена. Печать выдана.", ephemeral=True)
+        await safe_send(interaction, "✅ Глава 1 пройдена. Печать выдана.", ephemeral=True)
         return
 
     if isinstance(interaction.channel, discord.Thread):
@@ -857,7 +859,7 @@ async def ch1_apply_scene5(bot: commands.Bot, interaction: discord.Interaction, 
         )
         await interaction.channel.send("**Найдено секретов:** 0 из 1")
 
-    await interaction.response.send_message("❌ Порог не принял. Проклятие оформлено.", ephemeral=True)
+    await safe_send(interaction, "❌ Порог не принял. Проклятие оформлено.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -1,4 +1,4 @@
-# cogs/shop.py
+﻿# cogs/shop.py
 from __future__ import annotations
 
 import time
@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 
 import discord
 from discord.ext import commands
+
+from ._interactions import GuardedView, safe_defer_ephemeral, safe_send
 
 
 def _find_item(items: list[dict[str, Any]], item_id: str) -> Optional[dict[str, Any]]:
@@ -70,7 +72,7 @@ class CustomRoleButton(discord.ui.Button):
             await cog.handle_purchase(interaction, "custom_role", "custom_role")
 
 
-class TokensView(discord.ui.View):
+class TokensView(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
         cfg = bot.cfg  # type: ignore
@@ -85,7 +87,7 @@ class TokensView(discord.ui.View):
             self.add_item(TokenButton(item_id=item_id, label=label, row=row))
 
 
-class SoundsView(discord.ui.View):
+class SoundsView(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
         cfg = bot.cfg  # type: ignore
@@ -100,7 +102,7 @@ class SoundsView(discord.ui.View):
             self.add_item(SoundButton(item_id=item_id, label=label, row=row))
 
 
-class CustomRoleView(discord.ui.View):
+class CustomRoleView(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
         cfg = bot.cfg  # type: ignore
@@ -143,16 +145,16 @@ class ShopCog(commands.Cog, name="ShopCog"):
     async def _reply_ephemeral(self, interaction: discord.Interaction, text: str) -> None:
         # after defer -> followup
         try:
-            await interaction.followup.send(text, ephemeral=True)
+            await safe_send(interaction, text, ephemeral=True)
         except Exception:
             if not interaction.response.is_done():
-                await interaction.response.send_message(text, ephemeral=True)
+                await safe_send(interaction, text, ephemeral=True)
 
     async def handle_purchase(self, interaction: discord.Interaction, kind: str, item_id: str) -> None:
         # ✅ Сразу подтверждаем (иначе 404 Unknown interaction)
         try:
             if not interaction.response.is_done():
-                await interaction.response.defer(ephemeral=True, thinking=False)
+                await safe_defer_ephemeral(interaction)
         except Exception:
             return
 
@@ -377,3 +379,4 @@ def get_persistent_views(bot: commands.Bot):
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(ShopCog(bot))
+
