@@ -1,4 +1,4 @@
-# cogs/persistent.py
+﻿# cogs/persistent.py
 from __future__ import annotations
 
 import importlib
@@ -15,16 +15,12 @@ def _safe_import(name: str):
     try:
         return importlib.import_module(name)
     except Exception as e:
-        log.warning("Persistent: не смог импортировать %s: %s", name, e)
+        log.warning("Persistent: import failed for %s: %s", name, e)
         return None
 
 
 def _collect_views(bot: commands.Bot) -> List[discord.ui.View]:
-    """
-    Собираем persistent-view из когов.
-    Каждый cog-файл может (и должен) иметь функцию:
-      def get_persistent_views(bot) -> list[discord.ui.View]
-    """
+    """Collect persistent views from cogs via get_persistent_views(bot)."""
     views: List[discord.ui.View] = []
 
     for mod_name in (
@@ -32,7 +28,7 @@ def _collect_views(bot: commands.Bot) -> List[discord.ui.View]:
         "cogs.coin",
         "cogs.duel",
         "cogs.void_info",
-        # позже добавим:
+        "cogs.echo_posts",
         "cogs.story",
         "cogs.tendril",
     ):
@@ -49,43 +45,38 @@ def _collect_views(bot: commands.Bot) -> List[discord.ui.View]:
             if got:
                 views.extend(got)
         except Exception as e:
-            log.exception("Persistent: ошибка в get_persistent_views() у %s: %s", mod_name, e)
+            log.exception("Persistent: get_persistent_views() failed for %s: %s", mod_name, e)
 
     return views
 
 
 class PersistentCog(commands.Cog):
-    """
-    Этот ког при старте регистрирует все persistent views.
-    После этого кнопки на уже опубликованных сообщениях НЕ умирают при перезапуске.
-    """
+    """Register all timeout=None views so component buttons survive restarts."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._registered = False
 
     async def cog_load(self) -> None:
-        # cog_load вызывается при загрузке extension.
         if self._registered:
             return
         self._registered = True
 
         views = _collect_views(self.bot)
         if not views:
-            log.info("Persistent: views не найдены (пока нечего регистрировать).")
+            log.info("Persistent: no views to register.")
             return
 
         for v in views:
-            # ВАЖНО: persistent view должен быть timeout=None
             if v.timeout is not None:
-                log.warning("Persistent: view %s НЕ timeout=None, пропускаю.", type(v).__name__)
+                log.warning("Persistent: skip %s (timeout is not None)", type(v).__name__)
                 continue
 
             try:
-                self.bot.add_view(v)  # <— ключевая строка
-                log.info("Persistent: зарегистрирован view %s", type(v).__name__)
+                self.bot.add_view(v)
+                log.info("Persistent: registered view %s", type(v).__name__)
             except Exception as e:
-                log.exception("Persistent: не смог зарегистрировать %s: %s", type(v).__name__, e)
+                log.exception("Persistent: failed to register %s: %s", type(v).__name__, e)
 
 
 async def setup(bot: commands.Bot) -> None:

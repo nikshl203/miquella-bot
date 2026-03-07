@@ -43,7 +43,7 @@ class Ch1Scene1View(GuardedView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await is_my_story_thread(self.bot, interaction)
 
-    @discord.ui.button(label="«Я пришёл учиться.»", style=discord.ButtonStyle.primary, custom_id="story:ch1:s1:1")
+    @discord.ui.button(label="«Я пришёл учиться.»", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s1:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene1(self.bot, interaction, choice=1)
 
@@ -51,7 +51,7 @@ class Ch1Scene1View(GuardedView):
     async def b2(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene1(self.bot, interaction, choice=2)
 
-    @discord.ui.button(label="«Я пришёл, потому что иначе не выйду.»", style=discord.ButtonStyle.danger, custom_id="story:ch1:s1:3")
+    @discord.ui.button(label="«Я пришёл, потому что иначе не выйду.»", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s1:3")
     async def b3(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene1(self.bot, interaction, choice=3)
 
@@ -102,7 +102,7 @@ class Ch1Scene2View(GuardedView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await is_my_story_thread(self.bot, interaction)
 
-    @discord.ui.button(label="Назваться своим именем.", style=discord.ButtonStyle.primary, custom_id="story:ch1:s2:1")
+    @discord.ui.button(label="Назваться своим именем.", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s2:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene2(self.bot, interaction, choice=1)
 
@@ -110,7 +110,7 @@ class Ch1Scene2View(GuardedView):
     async def b2(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene2(self.bot, interaction, choice=2)
 
-    @discord.ui.button(label="Отказаться называться.", style=discord.ButtonStyle.danger, custom_id="story:ch1:s2:3")
+    @discord.ui.button(label="Отказаться называться.", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s2:3")
     async def b3(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene2(self.bot, interaction, choice=3)
 
@@ -162,7 +162,7 @@ class Ch1Scene3View(GuardedView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await is_my_story_thread(self.bot, interaction)
 
-    @discord.ui.button(label="Идти по разметке «проход».", style=discord.ButtonStyle.primary, custom_id="story:ch1:s3:1")
+    @discord.ui.button(label="Идти по разметке «проход».", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s3:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene3(self.bot, interaction, choice=1)
 
@@ -170,7 +170,7 @@ class Ch1Scene3View(GuardedView):
     async def b2(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene3(self.bot, interaction, choice=2)
 
-    @discord.ui.button(label="Шагнуть на «зону отказа» и посмотреть, что будет.", style=discord.ButtonStyle.danger, custom_id="story:ch1:s3:3")
+    @discord.ui.button(label="Шагнуть на «зону отказа» и посмотреть, что будет.", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s3:3")
     async def b3(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene3(self.bot, interaction, choice=3)
 
@@ -258,11 +258,11 @@ class Ch1Scene4View(GuardedView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await is_my_story_thread(self.bot, interaction)
 
-    @discord.ui.button(label="Забрать лист.", style=discord.ButtonStyle.primary, custom_id="story:ch1:s4:1")
+    @discord.ui.button(label="Забрать лист.", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s4:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene4(self.bot, interaction, choice=1)
 
-    @discord.ui.button(label="Сжечь лист на месте.", style=discord.ButtonStyle.danger, custom_id="story:ch1:s4:2")
+    @discord.ui.button(label="Сжечь лист на месте.", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s4:2")
     async def b2(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene4(self.bot, interaction, choice=2)
 
@@ -321,11 +321,11 @@ class Ch1Scene5View(GuardedView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await is_my_story_thread(self.bot, interaction)
 
-    @discord.ui.button(label="Подписать «возвращаться».", style=discord.ButtonStyle.primary, custom_id="story:ch1:s5:1")
+    @discord.ui.button(label="Подписать «возвращаться».", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s5:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene5(self.bot, interaction, choice=1)
 
-    @discord.ui.button(label="Подписать «отвечать».", style=discord.ButtonStyle.primary, custom_id="story:ch1:s5:2")
+    @discord.ui.button(label="Подписать «отвечать».", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s5:2")
     async def b2(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene5(self.bot, interaction, choice=2)
 
@@ -333,7 +333,7 @@ class Ch1Scene5View(GuardedView):
     async def b3(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene5(self.bot, interaction, choice=3)
 
-    @discord.ui.button(label="Порвать бланк.", style=discord.ButtonStyle.danger, custom_id="story:ch1:s5:4")
+    @discord.ui.button(label="Порвать бланк.", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s5:4")
     async def b4(self, interaction: discord.Interaction, _: discord.ui.Button):
         await ch1_apply_scene5(self.bot, interaction, choice=4)
 

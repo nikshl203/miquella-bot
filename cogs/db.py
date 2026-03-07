@@ -74,7 +74,10 @@ class Repo:
 
                 -- used by Activity/void_info
                 last_voice_award_ts INTEGER NOT NULL DEFAULT 0,
-                last_chat_award_ts INTEGER NOT NULL DEFAULT 0
+                last_chat_award_ts INTEGER NOT NULL DEFAULT 0,
+
+                -- active player decoration (empty = disabled)
+                active_decoration TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS story_progress(
@@ -142,6 +145,39 @@ CREATE TABLE IF NOT EXISTS tendrils(
                 stolen_total INTEGER NOT NULL DEFAULT 0,
                 attempts_left INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS rental_channels(
+                user_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS rental_posts(
+                message_id INTEGER PRIMARY KEY,
+                author_user_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS post_praises(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                author_user_id INTEGER NOT NULL,
+                praised_by_user_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                is_free INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS praise_daily_limits(
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                paid_runes_given INTEGER NOT NULL DEFAULT 0,
+                posts_praised_count INTEGER NOT NULL DEFAULT 0,
+                free_praises_used INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, date)
+            );
             """
         )
 
@@ -180,6 +216,10 @@ CREATE TABLE IF NOT EXISTS tendrils(
             await self.conn.execute(
                 "ALTER TABLE users ADD COLUMN last_chat_award_ts INTEGER NOT NULL DEFAULT 0"
             )
+        if "active_decoration" not in ucols:
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN active_decoration TEXT NOT NULL DEFAULT ''"
+            )
 
         # ---- codes: kind ----
         ccols = await self._table_cols("codes")
@@ -205,6 +245,58 @@ CREATE TABLE IF NOT EXISTS tendrils(
                 "ALTER TABLE daily_profit ADD COLUMN value INTEGER NOT NULL DEFAULT 0"
             )
 
+        # ---- rental/praise tables ----
+        await self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS rental_channels(
+                user_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS rental_posts(
+                message_id INTEGER PRIMARY KEY,
+                author_user_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS post_praises(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                author_user_id INTEGER NOT NULL,
+                praised_by_user_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                is_free INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS praise_daily_limits(
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                paid_runes_given INTEGER NOT NULL DEFAULT 0,
+                posts_praised_count INTEGER NOT NULL DEFAULT 0,
+                free_praises_used INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, date)
+            );
+            """
+        )
+
+        pdcols = await self._table_cols("praise_daily_limits")
+        if "paid_runes_given" not in pdcols:
+            await self.conn.execute(
+                "ALTER TABLE praise_daily_limits ADD COLUMN paid_runes_given INTEGER NOT NULL DEFAULT 0"
+            )
+        if "posts_praised_count" not in pdcols:
+            await self.conn.execute(
+                "ALTER TABLE praise_daily_limits ADD COLUMN posts_praised_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "free_praises_used" not in pdcols:
+            await self.conn.execute(
+                "ALTER TABLE praise_daily_limits ADD COLUMN free_praises_used INTEGER NOT NULL DEFAULT 0"
+            )
+
     # ---------- Users ----------
 
     async def ensure_user(self, user_id: int) -> None:
@@ -222,7 +314,7 @@ CREATE TABLE IF NOT EXISTS tendrils(
             """
             SELECT user_id, runes, xp, level,
                    day_key, voice_runes_today, chat_runes_today, voice_xp_today, chat_xp_today, voice_sec_bank,
-                   last_voice_award_ts, last_chat_award_ts
+                   last_voice_award_ts, last_chat_award_ts, active_decoration
             FROM users WHERE user_id=?
             """,
             (int(user_id),),
@@ -245,6 +337,7 @@ CREATE TABLE IF NOT EXISTS tendrils(
                 "voice_sec_bank": 0,
                 "last_voice_award_ts": 0,
                 "last_chat_award_ts": 0,
+                "active_decoration": "",
             }
 
         # sqlite3.Row supports dict-like access via keys()
@@ -271,6 +364,7 @@ CREATE TABLE IF NOT EXISTS tendrils(
             "voice_sec_bank": int(g("voice_sec_bank", 0)),
             "last_voice_award_ts": int(g("last_voice_award_ts", 0)),
             "last_chat_award_ts": int(g("last_chat_award_ts", 0)),
+            "active_decoration": str(g("active_decoration", "")) or "",
         }
 
     async def set_user_fields(self, user_id: int, **fields: Any) -> None:
@@ -313,6 +407,97 @@ CREATE TABLE IF NOT EXISTS tendrils(
         ok = cur.rowcount == 1
         await cur.close()
         return ok
+
+    async def transfer_runes(self, from_user_id: int, to_user_id: int, amount: int) -> bool:
+        """Atomic rune transfer. Returns False if sender lacks funds."""
+        assert self.conn
+        src = int(from_user_id)
+        dst = int(to_user_id)
+        delta = int(amount)
+
+        if delta <= 0 or src == dst:
+            return False
+
+        await self.ensure_user(src)
+        await self.ensure_user(dst)
+
+        try:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            cur = await self.conn.execute(
+                "UPDATE users SET runes = runes - ? WHERE user_id=? AND runes >= ?",
+                (delta, src, delta),
+            )
+            ok = int(cur.rowcount or 0) == 1
+            await cur.close()
+            if not ok:
+                await self.conn.execute("ROLLBACK")
+                return False
+            await self.conn.execute(
+                "UPDATE users SET runes = runes + ? WHERE user_id=?",
+                (delta, dst),
+            )
+            await self.conn.execute("COMMIT")
+            return True
+        except Exception:
+            try:
+                await self.conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    async def get_runes_rank_info(
+        self,
+        user_id: int,
+        scope_user_ids: set[int] | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Return player rank context in rune leaderboard.
+        If scope_user_ids is provided, ranking is calculated only within that scope.
+        """
+        assert self.conn
+        await self.ensure_user(user_id)
+
+        scope: set[int] | None = None
+        if scope_user_ids is not None:
+            scope = {int(x) for x in scope_user_ids}
+
+        cur = await self.conn.execute(
+            "SELECT user_id, runes, level FROM users ORDER BY runes DESC, level DESC"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+
+        rank = 0
+        prev_runes: int | None = None
+        target_uid = int(user_id)
+
+        for row in rows:
+            uid = int(row[0])
+            runes = int(row[1])
+
+            if scope is not None and uid not in scope:
+                continue
+
+            rank += 1
+            if uid == target_uid:
+                target = prev_runes if rank > 1 else None
+                needed = max(0, int(target or 0) - runes) if target is not None else 0
+                return {
+                    "rank": rank,
+                    "current_runes": runes,
+                    "next_rank_target_runes": target,
+                    "runes_needed": needed,
+                }
+
+            prev_runes = runes
+
+        u = await self.get_user(target_uid)
+        return {
+            "rank": 0,
+            "current_runes": int(u.get("runes", 0)),
+            "next_rank_target_runes": None,
+            "runes_needed": 0,
+        }
 
     
 
@@ -422,6 +607,253 @@ CREATE TABLE IF NOT EXISTS tendrils(
             VALUES(?,?,?)
             """,
             (int(user_id), sku, _now()),
+        )
+        await self.conn.commit()
+
+    async def purchases_by_kind(self, user_id: int, kind: str) -> set[str]:
+        assert self.conn
+        prefix = f"{str(kind)}:"
+        cur = await self.conn.execute(
+            "SELECT sku FROM purchases WHERE user_id=? AND sku LIKE ?",
+            (int(user_id), f"{prefix}%"),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+
+        out: set[str] = set()
+        for row in rows:
+            sku = str(row[0] or "")
+            if not sku.startswith(prefix):
+                continue
+            item_id = sku[len(prefix) :]
+            if item_id:
+                out.add(item_id)
+        return out
+
+    async def get_active_decoration(self, user_id: int) -> str:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT active_decoration FROM users WHERE user_id=?",
+            (int(user_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return ""
+        return str(row[0] or "")
+
+    async def set_active_decoration(self, user_id: int, decoration_id: str | None) -> None:
+        assert self.conn
+        await self.ensure_user(user_id)
+        value = str(decoration_id or "").strip()
+        await self.conn.execute(
+            "UPDATE users SET active_decoration=? WHERE user_id=?",
+            (value, int(user_id)),
+        )
+        await self.conn.commit()
+
+    # ---------- Rental channels / posts / praises ----------
+
+    async def rental_get_by_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT user_id, channel_id, expires_at, is_active FROM rental_channels WHERE user_id=?",
+            (int(user_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return {
+            "user_id": int(row[0]),
+            "channel_id": int(row[1]),
+            "expires_at": int(row[2]),
+            "is_active": int(row[3]),
+        }
+
+    async def rental_get_by_channel(self, channel_id: int) -> Optional[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT user_id, channel_id, expires_at, is_active FROM rental_channels WHERE channel_id=?",
+            (int(channel_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return {
+            "user_id": int(row[0]),
+            "channel_id": int(row[1]),
+            "expires_at": int(row[2]),
+            "is_active": int(row[3]),
+        }
+
+    async def rental_upsert(self, user_id: int, channel_id: int, expires_at: int, is_active: int) -> None:
+        assert self.conn
+        await self.conn.execute(
+            """
+            INSERT INTO rental_channels(user_id, channel_id, expires_at, is_active)
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                channel_id=excluded.channel_id,
+                expires_at=excluded.expires_at,
+                is_active=excluded.is_active
+            """,
+            (int(user_id), int(channel_id), int(expires_at), int(is_active)),
+        )
+        await self.conn.commit()
+
+    async def rental_set_active(self, user_id: int, is_active: int) -> None:
+        assert self.conn
+        await self.conn.execute(
+            "UPDATE rental_channels SET is_active=? WHERE user_id=?",
+            (int(is_active), int(user_id)),
+        )
+        await self.conn.commit()
+
+    async def rental_get_expired_active(self, now_ts: int) -> list[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT user_id, channel_id, expires_at, is_active
+            FROM rental_channels
+            WHERE is_active=1 AND expires_at <= ?
+            """,
+            (int(now_ts),),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {
+                "user_id": int(r[0]),
+                "channel_id": int(r[1]),
+                "expires_at": int(r[2]),
+                "is_active": int(r[3]),
+            }
+            for r in rows
+        ]
+
+    async def rental_list_all(self) -> list[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT user_id, channel_id, expires_at, is_active FROM rental_channels"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {
+                "user_id": int(r[0]),
+                "channel_id": int(r[1]),
+                "expires_at": int(r[2]),
+                "is_active": int(r[3]),
+            }
+            for r in rows
+        ]
+
+    async def rental_post_add(self, message_id: int, author_user_id: int, channel_id: int) -> None:
+        assert self.conn
+        await self.conn.execute(
+            """
+            INSERT OR REPLACE INTO rental_posts(message_id, author_user_id, channel_id, created_at)
+            VALUES(?,?,?,?)
+            """,
+            (int(message_id), int(author_user_id), int(channel_id), _now()),
+        )
+        await self.conn.commit()
+
+    async def rental_post_get(self, message_id: int) -> Optional[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT message_id, author_user_id, channel_id, created_at
+            FROM rental_posts WHERE message_id=?
+            """,
+            (int(message_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return {
+            "message_id": int(row[0]),
+            "author_user_id": int(row[1]),
+            "channel_id": int(row[2]),
+            "created_at": int(row[3]),
+        }
+
+    async def post_praise_add(
+        self,
+        message_id: int,
+        author_user_id: int,
+        praised_by_user_id: int,
+        amount: int,
+        is_free: bool,
+    ) -> None:
+        assert self.conn
+        await self.conn.execute(
+            """
+            INSERT INTO post_praises(message_id, author_user_id, praised_by_user_id, amount, is_free, created_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                int(message_id),
+                int(author_user_id),
+                int(praised_by_user_id),
+                int(amount),
+                1 if bool(is_free) else 0,
+                _now(),
+            ),
+        )
+        await self.conn.commit()
+
+    async def praise_daily_get(self, user_id: int, date_key: str) -> Dict[str, int]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT paid_runes_given, posts_praised_count, free_praises_used
+            FROM praise_daily_limits WHERE user_id=? AND date=?
+            """,
+            (int(user_id), str(date_key)),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return {
+                "paid_runes_given": 0,
+                "posts_praised_count": 0,
+                "free_praises_used": 0,
+            }
+        return {
+            "paid_runes_given": int(row[0]),
+            "posts_praised_count": int(row[1]),
+            "free_praises_used": int(row[2]),
+        }
+
+    async def praise_daily_add(
+        self,
+        user_id: int,
+        date_key: str,
+        paid_runes_delta: int,
+        posts_delta: int,
+        free_delta: int,
+    ) -> None:
+        assert self.conn
+        await self.conn.execute(
+            """
+            INSERT INTO praise_daily_limits(user_id, date, paid_runes_given, posts_praised_count, free_praises_used)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(user_id, date) DO UPDATE SET
+                paid_runes_given = paid_runes_given + excluded.paid_runes_given,
+                posts_praised_count = posts_praised_count + excluded.posts_praised_count,
+                free_praises_used = free_praises_used + excluded.free_praises_used
+            """,
+            (
+                int(user_id),
+                str(date_key),
+                int(paid_runes_delta),
+                int(posts_delta),
+                int(free_delta),
+            ),
         )
         await self.conn.commit()
 

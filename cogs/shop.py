@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional
 import discord
 from discord.ext import commands
 
+from .decorations import DECORATIONS_BY_ID, SHOP_DECORATIONS
+from .echo_posts import POST_FRAMES, POST_STYLES
 from ._interactions import GuardedView, safe_defer_ephemeral, safe_send
 
 
@@ -23,6 +25,12 @@ def _fmt_price(price: int) -> str:
 
 def _fmt_unlock(lvl: int) -> str:
     return f"ур.{int(lvl)}+"
+
+
+RENT_FIRST_COST = 100
+RENT_EXTEND_COST = 50
+RENT_RENAME_COST = 10
+RENT_TOPIC_COST = 10
 
 
 class TokenButton(discord.ui.Button):
@@ -57,6 +65,22 @@ class SoundButton(discord.ui.Button):
             await cog.handle_purchase(interaction, "sound", self.item_id)
 
 
+class DecorationButton(discord.ui.Button):
+    def __init__(self, item_id: str, label: str, row: int):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label=label[:80],
+            custom_id=f"shop:decoration:{item_id}",
+            row=row,
+        )
+        self.item_id = item_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cog: ShopCog = interaction.client.get_cog("ShopCog")  # type: ignore
+        if cog:
+            await cog.handle_purchase(interaction, "decoration", self.item_id)
+
+
 class CustomRoleButton(discord.ui.Button):
     def __init__(self, label: str):
         super().__init__(
@@ -70,6 +94,22 @@ class CustomRoleButton(discord.ui.Button):
         cog: ShopCog = interaction.client.get_cog("ShopCog")  # type: ignore
         if cog:
             await cog.handle_purchase(interaction, "custom_role", "custom_role")
+
+
+class RentalButton(discord.ui.Button):
+    def __init__(self, *, label: str, action: str, row: int = 0):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label=label[:80],
+            custom_id=f"shop:rental:{action}",
+            row=row,
+        )
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cog: ShopCog = interaction.client.get_cog("ShopCog")  # type: ignore
+        if cog:
+            await cog.handle_purchase(interaction, "rental", self.action)
 
 
 class TokensView(GuardedView):
@@ -102,6 +142,16 @@ class SoundsView(GuardedView):
             self.add_item(SoundButton(item_id=item_id, label=label, row=row))
 
 
+class DecorationsView(GuardedView):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
+        _ = bot
+        for i, d in enumerate(SHOP_DECORATIONS):
+            label = f"{d.emoji} {d.name} • {_fmt_price(d.price)}"
+            row = i // 5
+            self.add_item(DecorationButton(item_id=d.id, label=label, row=row))
+
+
 class CustomRoleView(GuardedView):
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
@@ -110,11 +160,93 @@ class CustomRoleView(GuardedView):
         self.add_item(CustomRoleButton(label=f"🪪 Своя роль • {_fmt_price(price)}"))
 
 
+class RentalOffersView(GuardedView):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
+        _ = bot
+        self.add_item(
+            RentalButton(
+                label=f"📃 Аренда канала на месяц • {_fmt_price(RENT_FIRST_COST)}",
+                action="rent",
+                row=0,
+            )
+        )
+        self.add_item(
+            RentalButton(
+                label=f"⏳ Продление канала на месяц • {_fmt_price(RENT_EXTEND_COST)}",
+                action="extend",
+                row=0,
+            )
+        )
+        self.add_item(
+            RentalButton(
+                label=f"✍️ Смена имени канала • {_fmt_price(RENT_RENAME_COST)}",
+                action="rename_name",
+                row=1,
+            )
+        )
+        self.add_item(
+            RentalButton(
+                label=f"🧾 Смена описания канала • {_fmt_price(RENT_TOPIC_COST)}",
+                action="rename_topic",
+                row=1,
+            )
+        )
+
+
+class PostCosmeticButton(discord.ui.Button):
+    def __init__(self, *, kind: str, item_id: str, label: str, row: int):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label=label[:80],
+            custom_id=f"shop:{kind}:{item_id}",
+            row=row,
+        )
+        self.kind = kind
+        self.item_id = item_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cog: ShopCog = interaction.client.get_cog("ShopCog")  # type: ignore
+        if cog:
+            await cog.handle_purchase(interaction, self.kind, self.item_id)
+
+
+class PostCosmeticsView(GuardedView):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
+        _ = bot
+
+        for i, s in enumerate(POST_STYLES):
+            label = f"{s['emoji']} {s['name']} • {_fmt_price(int(s['price']))}"
+            self.add_item(
+                PostCosmeticButton(
+                    kind="post_style",
+                    item_id=str(s["id"]),
+                    label=label,
+                    row=0 if i < 5 else 1,
+                )
+            )
+
+        for i, f in enumerate(POST_FRAMES):
+            label = f"🧱 {f['name']} • {_fmt_price(int(f['price']))}"
+            self.add_item(
+                PostCosmeticButton(
+                    kind="post_frame",
+                    item_id=str(f["id"]),
+                    label=label,
+                    row=2 if i < 5 else 3,
+                )
+            )
+
+
 class ShopCog(commands.Cog, name="ShopCog"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
         self.tokens_view = TokensView(bot)
+        self.decorations_view = DecorationsView(bot)
+        self.rental_view = RentalOffersView(bot)
+        self.post_cosmetics_view = PostCosmeticsView(bot)
         # sounds disabled if list empty
         cfg = bot.cfg  # type: ignore
         sounds = list(cfg.get("shop", {}).get("sounds", []))
@@ -211,6 +343,79 @@ class ShopCog(commands.Cog, name="ShopCog"):
                         pass
 
             await self._reply_ephemeral(interaction, f"✅ Жетон получен: **{item['label']}**.")
+            return
+
+        # ---------- DECORATION ----------
+        if kind == "decoration":
+            item = DECORATIONS_BY_ID.get(item_id)
+            if not item or not item.shop:
+                await self._reply_ephemeral(interaction, "❌ Это украшение недоступно в магазине.")
+                return
+
+            price = int(item.price)
+
+            if await repo.purchase_has(user_id, "decoration", item_id):
+                await self._reply_ephemeral(interaction, "Это украшение уже есть в твоей коллекции.")
+                return
+
+            if not await self._can_pay(user_id, price):
+                await self._reply_ephemeral(interaction, f"Не хватает рун: **{runes}/{price}**.")
+                return
+
+            paid = await self._pay(user_id, price)
+            if not paid:
+                u2 = await self._get_user(user_id)
+                runes2 = int(u2.get("runes", 0))
+                await self._reply_ephemeral(interaction, f"Не хватает рун: **{runes2}/{price}**.")
+                return
+
+            await repo.purchase_add(user_id, "decoration", item_id)
+            await self._reply_ephemeral(interaction, f"✅ Украшение добавлено: **{item.emoji} {item.name}**.")
+            return
+
+        # ---------- POST STYLES / FRAMES ----------
+        if kind in {"post_style", "post_frame"}:
+            catalog = POST_STYLES if kind == "post_style" else POST_FRAMES
+            item = next((x for x in catalog if str(x.get("id")) == str(item_id)), None)
+            if not item:
+                await self._reply_ephemeral(interaction, "❌ Этот элемент оформления недоступен.")
+                return
+
+            price = int(item.get("price", 0))
+            if await repo.purchase_has(user_id, kind, item_id):
+                await self._reply_ephemeral(interaction, "Этот элемент уже есть у тебя.")
+                return
+
+            if not await self._can_pay(user_id, price):
+                await self._reply_ephemeral(interaction, f"Не хватает рун: **{runes}/{price}**.")
+                return
+
+            paid = await self._pay(user_id, price)
+            if not paid:
+                u2 = await self._get_user(user_id)
+                runes2 = int(u2.get("runes", 0))
+                await self._reply_ephemeral(interaction, f"Не хватает рун: **{runes2}/{price}**.")
+                return
+
+            await repo.purchase_add(user_id, kind, item_id)
+            icon = str(item.get("emoji", "🧱" if kind == "post_frame" else "🎨"))
+            name = str(item.get("name", item_id))
+            await self._reply_ephemeral(interaction, f"✅ Получено оформление: **{icon} {name}**.")
+            return
+
+        # ---------- RENTAL CHANNEL ----------
+        if kind == "rental":
+            rental_cog = self.bot.get_cog("EchoPostsCog")
+            if rental_cog is None:
+                await self._reply_ephemeral(interaction, "❌ Механика аренды временно недоступна.")
+                return
+            if item_id not in {"rent", "extend", "rename_name", "rename_topic"}:
+                await self._reply_ephemeral(interaction, "❌ Непонятный ритуал аренды.")
+                return
+            try:
+                await rental_cog.handle_shop_rental(interaction, item_id)  # type: ignore[attr-defined]
+            except Exception:
+                await self._reply_ephemeral(interaction, "❌ Не удалось обработать аренду. Попробуй ещё раз.")
             return
 
         # ---------- SOUND ----------
@@ -332,6 +537,90 @@ class ShopCog(commands.Cog, name="ShopCog"):
 
         posted += 1
 
+        dec_lines = [f"• {d.emoji} **{d.name}** — {_fmt_price(d.price)}" for d in SHOP_DECORATIONS]
+        emb_dec = discord.Embed(
+            title="✨ Украшения Пустоты",
+            description="Купленные украшения можно активировать в панели «Информация Пустоты».",
+        )
+        emb_dec.add_field(name="Список", value="\n".join(dec_lines) if dec_lines else "—", inline=False)
+        m_dec = await ch.send(embed=emb_dec, view=self.decorations_view)
+        try:
+            await m_dec.pin()
+        except Exception:
+            pass
+
+        posted += 1
+
+        emb_rent = discord.Embed(
+            title="📃 Посты Отголосков",
+            description=(
+                "Личный канал в категории **📃Посты Отголосков**.\n"
+                "В канале доступны публикации постов и похвала рунами."
+            ),
+        )
+        emb_rent.add_field(
+            name=f"Аренда канала на месяц — {_fmt_price(RENT_FIRST_COST)}",
+            value=(
+                "Обрети собственный свиток в чертогах Отголосков.\n"
+                "На 30 дней тебе будет дарован личный зал, где лишь ты сможешь оставлять свои письмена, "
+                "а иные — читать и воздавать им рунами."
+            ),
+            inline=False,
+        )
+        emb_rent.add_field(
+            name=f"Продлить аренду канала на месяц — {_fmt_price(RENT_EXTEND_COST)}",
+            value="Продли звучание своего Отголоска еще на 30 дней, дабы письмена не канули в безмолвие.",
+            inline=False,
+        )
+        emb_rent.add_field(
+            name=f"Смена имени канала — {_fmt_price(RENT_RENAME_COST)}",
+            value=(
+                "Измени имя своего зала через ЛС с Пустотой.\n"
+                "Ограничения: до 20 символов и имя не должно повторяться."
+            ),
+            inline=False,
+        )
+        emb_rent.add_field(
+            name=f"Смена описания канала — {_fmt_price(RENT_TOPIC_COST)}",
+            value="Пустота примет новый текст описания твоего канала через ЛС.",
+            inline=False,
+        )
+        m_rent = await ch.send(embed=emb_rent, view=self.rental_view)
+        try:
+            await m_rent.pin()
+        except Exception:
+            pass
+
+        posted += 1
+
+        style_lines = [f"• {s['emoji']} **{s['name']}** — {_fmt_price(int(s['price']))}" for s in POST_STYLES]
+        frame_lines = [f"• **{f['name']}** — {_fmt_price(int(f['price']))}" for f in POST_FRAMES]
+
+        emb_post_style = discord.Embed(
+            title="🖋 Стили и рамки постов",
+            description=(
+                "Оформление для публикаций в личном канале Отголосков.\n"
+                "При публикации поста выбор доступен только из купленных элементов."
+            ),
+        )
+        emb_post_style.add_field(
+            name="Стили (шапка поста)",
+            value="\n".join(style_lines) if style_lines else "—",
+            inline=False,
+        )
+        emb_post_style.add_field(
+            name="Рамки (оформление шапки)",
+            value="\n".join(frame_lines) if frame_lines else "—",
+            inline=False,
+        )
+        m_post_style = await ch.send(embed=emb_post_style, view=self.post_cosmetics_view)
+        try:
+            await m_post_style.pin()
+        except Exception:
+            pass
+
+        posted += 1
+
         if sounds:
             emb2 = discord.Embed(
                 title="🔊 Звуки",
@@ -370,6 +659,9 @@ def get_persistent_views(bot: commands.Bot):
     sounds = list(shop_cfg.get("sounds", []))[:15]
 
     views = [TokensView(bot)]
+    views.append(DecorationsView(bot))
+    views.append(RentalOffersView(bot))
+    views.append(PostCosmeticsView(bot))
     if sounds:
         views.append(SoundsView(bot))
     views.append(CustomRoleView(bot))

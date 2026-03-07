@@ -9,7 +9,14 @@ from typing import Any, Optional, Tuple
 import discord
 from discord.ext import commands
 
-from ._interactions import GuardedView
+from ._interactions import GuardedView, safe_send
+from .decorations import (
+    DECORATIONS_BY_ID,
+    SHOP_DECORATIONS,
+    STORY_DECORATION_ID,
+    STORY_DECORATION_ROLE_NAME,
+    Decoration,
+)
 
 
 def _is_admin(bot: commands.Bot, user_id: int) -> bool:
@@ -204,6 +211,65 @@ async def _fetch_top10_by_runes(bot: commands.Bot, guild: Optional[discord.Guild
     return out
 
 
+def _leaderboard_scope_ids(guild: Optional[discord.Guild]) -> set[int] | None:
+    if guild is None:
+        return None
+    return {int(m.id) for m in guild.members}
+
+
+def _story_reward_role_id(bot: commands.Bot) -> int:
+    cfg = bot.cfg  # type: ignore
+    chapters = ((cfg.get("story", {}) or {}).get("chapters", []) or [])
+    for ch in chapters:
+        if _digits(ch.get("id", 0), 0) != 1:
+            continue
+        role_id = _digits(ch.get("reward_role_id", 0), 0)
+        if role_id > 0:
+            return role_id
+    return 0
+
+
+def _has_story_decoration_access(bot: commands.Bot, member: discord.Member) -> bool:
+    role_id = _story_reward_role_id(bot)
+    if role_id > 0 and member.get_role(role_id):
+        return True
+    target = STORY_DECORATION_ROLE_NAME.casefold()
+    for role in member.roles:
+        if str(role.name).strip().casefold() == target:
+            return True
+    return False
+
+
+async def _available_decorations(bot: commands.Bot, member: discord.Member) -> list[Decoration]:
+    repo = bot.repo  # type: ignore
+    owned = await repo.purchases_by_kind(member.id, "decoration")
+
+    out: list[Decoration] = [d for d in SHOP_DECORATIONS if d.id in owned]
+    story_dec = DECORATIONS_BY_ID.get(STORY_DECORATION_ID)
+    if story_dec and _has_story_decoration_access(bot, member):
+        out.append(story_dec)
+
+    return out
+
+
+def _resolve_active_decoration(
+    bot: commands.Bot,
+    member: Optional[discord.Member],
+    decoration_id: str,
+) -> Optional[Decoration]:
+    d = DECORATIONS_BY_ID.get(str(decoration_id or ""))
+    if not d:
+        return None
+
+    if d.id == STORY_DECORATION_ID:
+        if member is None:
+            return None
+        if not _has_story_decoration_access(bot, member):
+            return None
+
+    return d
+
+
 def _voice_mode_now(bot: commands.Bot, member: discord.Member) -> str:
     afk_id, _, solo_mult = _voice_params(bot)
 
@@ -225,6 +291,80 @@ def _voice_mode_now(bot: commands.Bot, member: discord.Member) -> str:
     if n >= 2:
         return "2+ в канале (100%)"
     return f"соло ({int(round(solo_mult*100))}%)"
+
+
+class DecorationPickSelect(discord.ui.Select):
+    def __init__(self, bot: commands.Bot, owner_id: int, options: list[Decoration], current_id: str):
+        self.bot = bot
+        self.owner_id = int(owner_id)
+        self.allowed_ids: set[str] = {"none"}
+
+        select_options: list[discord.SelectOption] = [
+            discord.SelectOption(
+                label="Без украшения",
+                value="none",
+                description="Скрыть строку Печать в летописи",
+                default=(not current_id),
+            )
+        ]
+
+        for d in options:
+            self.allowed_ids.add(d.id)
+            select_options.append(
+                discord.SelectOption(
+                    label=d.name[:100],
+                    value=d.id,
+                    emoji=d.emoji,
+                    default=(d.id == current_id),
+                )
+            )
+
+        super().__init__(
+            placeholder="Выбери активное украшение",
+            min_values=1,
+            max_values=1,
+            options=select_options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await safe_send(interaction, "Это меню не для тебя.", ephemeral=True)
+            return
+
+        selected = str(self.values[0] if self.values else "none")
+        if selected not in self.allowed_ids:
+            await safe_send(interaction, "Украшение недоступно.", ephemeral=True)
+            return
+
+        repo = self.bot.repo  # type: ignore
+        if selected == "none":
+            await repo.set_active_decoration(self.owner_id, None)
+            text = "✅ Активное украшение снято."
+        else:
+            await repo.set_active_decoration(self.owner_id, selected)
+            d = DECORATIONS_BY_ID.get(selected)
+            if d:
+                text = f"✅ Активно: {d.emoji} {d.name}."
+            else:
+                text = "✅ Украшение обновлено."
+
+        try:
+            await interaction.response.edit_message(content=text, embed=None, view=None)
+        except Exception:
+            await safe_send(interaction, text, ephemeral=True)
+
+
+class DecorationPickView(GuardedView):
+    def __init__(self, bot: commands.Bot, owner_id: int, options: list[Decoration], current_id: str):
+        super().__init__(timeout=120)
+        self.owner_id = int(owner_id)
+        self.add_item(DecorationPickSelect(bot, owner_id, options, current_id))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await safe_send(interaction, "Это меню не для тебя.", ephemeral=True)
+            return False
+        return True
 
 
 class VoidInfoView(GuardedView):
@@ -278,6 +418,14 @@ class VoidInfoView(GuardedView):
         cooldown, min_chars, base_runes, base_xp, media_runes, media_xp = _chat_params(self.bot)
 
         emb = discord.Embed(title="🕳️ Твой след в Пустоте", color=0x2B2D31)
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None and interaction.guild:
+            member = interaction.guild.get_member(uid)
+
+        active_id = await repo.get_active_decoration(uid)
+        active_dec = _resolve_active_decoration(self.bot, member, active_id)
+        if active_dec:
+            emb.description = f"{active_dec.emoji} {active_dec.name}"
 
         # верхняя строка как в income
         emb.add_field(name="Уровень", value=f"**{level}** / {max_lvl}", inline=True)
@@ -328,6 +476,75 @@ class VoidInfoView(GuardedView):
         except (discord.NotFound, discord.HTTPException):
             pass
 
+    @discord.ui.button(
+        label="Выбрать украшение",
+        style=discord.ButtonStyle.secondary,
+        custom_id="void:pick_decoration",
+    )
+    async def pick_decoration(self, interaction: discord.Interaction, _: discord.ui.Button):
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None and interaction.guild:
+            member = interaction.guild.get_member(interaction.user.id)
+        if member is None:
+            await safe_send(interaction, "Открой выбор украшения внутри сервера.", ephemeral=True)
+            return
+
+        repo = self.bot.repo  # type: ignore
+        current_id = await repo.get_active_decoration(member.id)
+        options = await _available_decorations(self.bot, member)
+
+        if current_id and _resolve_active_decoration(self.bot, member, current_id) is None:
+            await repo.set_active_decoration(member.id, None)
+            current_id = ""
+
+        view = DecorationPickView(self.bot, member.id, options, current_id)
+        if options:
+            desc = f"Доступно украшений: **{len(options)}**.\nВыбери одно активное или отключи украшение."
+        else:
+            desc = "У тебя пока нет доступных украшений. Купи их в магазине Пустоты."
+
+        emb = discord.Embed(title="✨ Выбор украшения", description=desc)
+        await safe_send(interaction, embed=emb, view=view, ephemeral=True)
+
+    @discord.ui.button(
+        label="Моё место в летописи",
+        style=discord.ButtonStyle.secondary,
+        custom_id="void:my_rank",
+    )
+    async def my_rank(self, interaction: discord.Interaction, _: discord.ui.Button):
+        ok = await _safe_defer(interaction, ephemeral=True)
+        if not ok:
+            return
+
+        repo = self.bot.repo  # type: ignore
+        uid = int(interaction.user.id)
+        scope_ids = _leaderboard_scope_ids(interaction.guild)
+        info = await repo.get_runes_rank_info(uid, scope_user_ids=scope_ids)
+
+        rank = int(info.get("rank", 0) or 0)
+        runes = int(info.get("current_runes", 0) or 0)
+
+        if rank <= 0:
+            text = (
+                "Ты пока не попал в Летопись Пустоты.\n"
+                f"У тебя {runes} рун."
+            )
+        elif rank == 1:
+            text = (
+                "Ты находишься на 1 месте в Летописи Пустоты.\n"
+                f"У тебя {runes} рун.\n"
+                "Ты возглавляешь летопись."
+            )
+        else:
+            need = int(info.get("runes_needed", 0) or 0)
+            text = (
+                f"Ты находишься на {rank} месте в Летописи Пустоты.\n"
+                f"У тебя {runes} рун.\n"
+                f"До {rank - 1} места осталось {need} рун."
+            )
+
+        await safe_send(interaction, text, ephemeral=True)
+
 
 class LeaderboardView(GuardedView):
     def __init__(self, bot: commands.Bot):
@@ -345,12 +562,17 @@ class LeaderboardView(GuardedView):
             return
 
         rows = await _fetch_top10_by_runes(self.bot, interaction.guild)
+        repo = self.bot.repo  # type: ignore
 
         lines: list[str] = []
         for i, (uid, runes, lvl) in enumerate(rows, start=1):
             member = interaction.guild.get_member(uid) if interaction.guild else None
             name = member.mention if member else f"`{uid}`"
             lines.append(f"**{i}.** {name} — **{runes}** рун | ур.{lvl}")
+            active_id = await repo.get_active_decoration(uid)
+            active_dec = _resolve_active_decoration(self.bot, member, active_id)
+            if active_dec:
+                lines.append(f"{active_dec.emoji} {active_dec.name}")
 
         emb = discord.Embed(
             title="🏛️ Летопись Пустоты — топ 10 по рунам",
@@ -410,11 +632,16 @@ class VoidInfoCog(commands.Cog):
             pass
 
         rows = await _fetch_top10_by_runes(self.bot, ctx.guild)
+        repo = self.bot.repo  # type: ignore
         lines: list[str] = []
         for i, (uid, runes, lvl) in enumerate(rows, start=1):
             member = ctx.guild.get_member(uid) if ctx.guild else None
             name = member.mention if member else f"`{uid}`"
             lines.append(f"**{i}.** {name} — **{runes}** рун | ур.{lvl}")
+            active_id = await repo.get_active_decoration(uid)
+            active_dec = _resolve_active_decoration(self.bot, member, active_id)
+            if active_dec:
+                lines.append(f"{active_dec.emoji} {active_dec.name}")
 
         emb2 = discord.Embed(
             title="🏛️ Летопись Пустоты — топ 10 по рунам",

@@ -69,6 +69,7 @@ class VoidBot(commands.Bot):
             "cogs.welcome",
             "cogs.survey",
             "cogs.shop",
+            "cogs.echo_posts",
             "cogs.void_info",
             "cogs.tendril",
             "cogs.coin",
