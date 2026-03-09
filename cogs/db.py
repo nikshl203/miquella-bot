@@ -1,6 +1,7 @@
 ﻿# cogs/db.py
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import string
@@ -16,6 +17,7 @@ log = logging.getLogger("void")
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "bot.sqlite3"
+DEFAULT_FAVORITES_PLAYLIST_NAME = "Избранное"
 
 
 def _now() -> int:
@@ -101,6 +103,21 @@ class Repo:
                 thread_id INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS story_audio_resume(
+                user_id INTEGER PRIMARY KEY,
+                show_title TEXT NOT NULL DEFAULT '',
+                episode_title TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                audio_url TEXT NOT NULL DEFAULT '',
+                webpage_url TEXT NOT NULL DEFAULT '',
+                artwork_url TEXT NOT NULL DEFAULT '',
+                feed_url TEXT NOT NULL DEFAULT '',
+                episode_guid TEXT NOT NULL DEFAULT '',
+                duration_sec INTEGER NOT NULL DEFAULT 0,
+                resume_position_sec INTEGER NOT NULL DEFAULT 0,
+                updated_ts INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS codes(
                 code TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
@@ -178,6 +195,40 @@ CREATE TABLE IF NOT EXISTS tendrils(
                 free_praises_used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(user_id, date)
             );
+
+            CREATE TABLE IF NOT EXISTS playlists(
+                playlist_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                is_favorites INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS playlist_tracks(
+                playlist_track_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                playlist_id INTEGER NOT NULL,
+                track_position INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                source_track_ref TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                duration INTEGER NOT NULL DEFAULT 0,
+                artwork_url TEXT NOT NULL DEFAULT '',
+                canonical_url TEXT NOT NULL DEFAULT '',
+                playable_payload TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(playlist_id) REFERENCES playlists(playlist_id) ON DELETE CASCADE
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_owner_name_nocase
+            ON playlists(owner_user_id, name COLLATE NOCASE);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_owner_favorites_unique
+            ON playlists(owner_user_id, is_favorites)
+            WHERE is_favorites = 1;
+
+            CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_position
+            ON playlist_tracks(playlist_id, track_position);
 
             CREATE TABLE IF NOT EXISTS order_members(
                 user_id INTEGER PRIMARY KEY,
@@ -281,6 +332,25 @@ CREATE TABLE IF NOT EXISTS tendrils(
         """Idempotent migrations for older DBs."""
         assert self.conn
 
+        await self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS story_audio_resume(
+                user_id INTEGER PRIMARY KEY,
+                show_title TEXT NOT NULL DEFAULT '',
+                episode_title TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                audio_url TEXT NOT NULL DEFAULT '',
+                webpage_url TEXT NOT NULL DEFAULT '',
+                artwork_url TEXT NOT NULL DEFAULT '',
+                feed_url TEXT NOT NULL DEFAULT '',
+                episode_guid TEXT NOT NULL DEFAULT '',
+                duration_sec INTEGER NOT NULL DEFAULT 0,
+                resume_position_sec INTEGER NOT NULL DEFAULT 0,
+                updated_ts INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
         # ---- users: award timestamps ----
         ucols = await self._table_cols("users")
         if "last_voice_award_ts" not in ucols:
@@ -355,6 +425,40 @@ CREATE TABLE IF NOT EXISTS tendrils(
                 free_praises_used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(user_id, date)
             );
+
+            CREATE TABLE IF NOT EXISTS playlists(
+                playlist_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                is_favorites INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS playlist_tracks(
+                playlist_track_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                playlist_id INTEGER NOT NULL,
+                track_position INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                source_track_ref TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                duration INTEGER NOT NULL DEFAULT 0,
+                artwork_url TEXT NOT NULL DEFAULT '',
+                canonical_url TEXT NOT NULL DEFAULT '',
+                playable_payload TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(playlist_id) REFERENCES playlists(playlist_id) ON DELETE CASCADE
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_owner_name_nocase
+            ON playlists(owner_user_id, name COLLATE NOCASE);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_owner_favorites_unique
+            ON playlists(owner_user_id, is_favorites)
+            WHERE is_favorites = 1;
+
+            CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_position
+            ON playlist_tracks(playlist_id, track_position);
             """
         )
 
@@ -450,6 +554,73 @@ CREATE TABLE IF NOT EXISTS tendrils(
         if "free_praises_used" not in pdcols:
             await self.conn.execute(
                 "ALTER TABLE praise_daily_limits ADD COLUMN free_praises_used INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # ---- playlists ----
+        await self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS playlists(
+                playlist_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                is_favorites INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS playlist_tracks(
+                playlist_track_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                playlist_id INTEGER NOT NULL,
+                track_position INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                source_track_ref TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                duration INTEGER NOT NULL DEFAULT 0,
+                artwork_url TEXT NOT NULL DEFAULT '',
+                canonical_url TEXT NOT NULL DEFAULT '',
+                playable_payload TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(playlist_id) REFERENCES playlists(playlist_id) ON DELETE CASCADE
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_owner_name_nocase
+            ON playlists(owner_user_id, name COLLATE NOCASE);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_owner_favorites_unique
+            ON playlists(owner_user_id, is_favorites)
+            WHERE is_favorites = 1;
+
+            CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_position
+            ON playlist_tracks(playlist_id, track_position);
+            """
+        )
+
+        plcols = await self._table_cols("playlists")
+        if "is_favorites" not in plcols:
+            await self.conn.execute(
+                "ALTER TABLE playlists ADD COLUMN is_favorites INTEGER NOT NULL DEFAULT 0"
+            )
+        if "created_at" not in plcols:
+            await self.conn.execute(
+                "ALTER TABLE playlists ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"
+            )
+
+        ptcols = await self._table_cols("playlist_tracks")
+        if "source_track_ref" not in ptcols:
+            await self.conn.execute(
+                "ALTER TABLE playlist_tracks ADD COLUMN source_track_ref TEXT NOT NULL DEFAULT ''"
+            )
+        if "artwork_url" not in ptcols:
+            await self.conn.execute(
+                "ALTER TABLE playlist_tracks ADD COLUMN artwork_url TEXT NOT NULL DEFAULT ''"
+            )
+        if "canonical_url" not in ptcols:
+            await self.conn.execute(
+                "ALTER TABLE playlist_tracks ADD COLUMN canonical_url TEXT NOT NULL DEFAULT ''"
+            )
+        if "playable_payload" not in ptcols:
+            await self.conn.execute(
+                "ALTER TABLE playlist_tracks ADD COLUMN playable_payload TEXT NOT NULL DEFAULT ''"
             )
 
     # ---------- Users ----------
@@ -1551,6 +1722,313 @@ CREATE TABLE IF NOT EXISTS tendrils(
         )
         await self.conn.commit()
 
+    # ---------- Music playlists ----------
+
+    def _playlist_row_to_dict(self, row: aiosqlite.Row | None) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        return {
+            "playlist_id": int(row["playlist_id"]),
+            "owner_user_id": int(row["owner_user_id"]),
+            "name": str(row["name"] or ""),
+            "is_favorites": bool(int(row["is_favorites"] or 0)),
+            "created_at": int(row["created_at"] or 0),
+            "track_count": int(row["track_count"] or 0) if "track_count" in row.keys() else 0,
+        }
+
+    def _playlist_track_row_to_dict(self, row: aiosqlite.Row | None) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        raw_payload = str(row["playable_payload"] or "")
+        try:
+            payload = json.loads(raw_payload) if raw_payload else {}
+        except Exception:
+            payload = {}
+        return {
+            "playlist_track_id": int(row["playlist_track_id"]),
+            "playlist_id": int(row["playlist_id"]),
+            "track_position": int(row["track_position"] or 0),
+            "source": str(row["source"] or ""),
+            "source_track_ref": str(row["source_track_ref"] or ""),
+            "title": str(row["title"] or ""),
+            "artist": str(row["artist"] or ""),
+            "duration": int(row["duration"] or 0),
+            "artwork_url": str(row["artwork_url"] or ""),
+            "canonical_url": str(row["canonical_url"] or ""),
+            "playable_payload": payload,
+            "created_at": int(row["created_at"] or 0),
+        }
+
+    async def _playlist_ensure_favorites_tx(self, owner_user_id: int) -> Dict[str, Any]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT playlist_id, owner_user_id, name, is_favorites, created_at
+            FROM playlists
+            WHERE owner_user_id=? AND is_favorites=1
+            LIMIT 1
+            """,
+            (int(owner_user_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        playlist = self._playlist_row_to_dict(row)
+        if playlist is not None:
+            if playlist["name"] != DEFAULT_FAVORITES_PLAYLIST_NAME:
+                await self.conn.execute(
+                    "UPDATE playlists SET name=? WHERE playlist_id=?",
+                    (DEFAULT_FAVORITES_PLAYLIST_NAME, int(playlist["playlist_id"])),
+                )
+                playlist["name"] = DEFAULT_FAVORITES_PLAYLIST_NAME
+            return playlist
+
+        created_at = _now()
+        try:
+            cur = await self.conn.execute(
+                """
+                INSERT INTO playlists(owner_user_id, name, is_favorites, created_at)
+                VALUES(?,?,1,?)
+                """,
+                (int(owner_user_id), DEFAULT_FAVORITES_PLAYLIST_NAME, created_at),
+            )
+            playlist_id = int(cur.lastrowid or 0)
+            await cur.close()
+            return {
+                "playlist_id": playlist_id,
+                "owner_user_id": int(owner_user_id),
+                "name": DEFAULT_FAVORITES_PLAYLIST_NAME,
+                "is_favorites": True,
+                "created_at": created_at,
+            }
+        except aiosqlite.IntegrityError:
+            cur = await self.conn.execute(
+                """
+                SELECT playlist_id, owner_user_id, name, is_favorites, created_at
+                FROM playlists
+                WHERE owner_user_id=? AND is_favorites=1
+                LIMIT 1
+                """,
+                (int(owner_user_id),),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            playlist = self._playlist_row_to_dict(row)
+            if playlist is None:
+                raise
+            return playlist
+
+    async def playlist_ensure_favorites(self, owner_user_id: int) -> Dict[str, Any]:
+        assert self.conn
+        await self.ensure_user(owner_user_id)
+        playlist = await self._playlist_ensure_favorites_tx(int(owner_user_id))
+        await self.conn.commit()
+        return playlist
+
+    async def playlist_list(self, owner_user_id: int) -> list[Dict[str, Any]]:
+        assert self.conn
+        await self.ensure_user(owner_user_id)
+        await self._playlist_ensure_favorites_tx(int(owner_user_id))
+        cur = await self.conn.execute(
+            """
+            SELECT p.playlist_id, p.owner_user_id, p.name, p.is_favorites, p.created_at,
+                   (SELECT COUNT(1) FROM playlist_tracks pt WHERE pt.playlist_id = p.playlist_id) AS track_count
+            FROM playlists p
+            WHERE owner_user_id=?
+            ORDER BY is_favorites DESC, LOWER(name) ASC, playlist_id ASC
+            """,
+            (int(owner_user_id),),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        await self.conn.commit()
+        return [self._playlist_row_to_dict(row) for row in rows if row is not None]
+
+    async def playlist_get(self, owner_user_id: int, playlist_id: int) -> Optional[Dict[str, Any]]:
+        assert self.conn
+        await self.ensure_user(owner_user_id)
+        await self._playlist_ensure_favorites_tx(int(owner_user_id))
+        cur = await self.conn.execute(
+            """
+            SELECT p.playlist_id, p.owner_user_id, p.name, p.is_favorites, p.created_at,
+                   (SELECT COUNT(1) FROM playlist_tracks pt WHERE pt.playlist_id = p.playlist_id) AS track_count
+            FROM playlists p
+            WHERE owner_user_id=? AND playlist_id=?
+            LIMIT 1
+            """,
+            (int(owner_user_id), int(playlist_id)),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        await self.conn.commit()
+        return self._playlist_row_to_dict(row)
+
+    async def playlist_create(self, owner_user_id: int, name: str) -> Dict[str, Any]:
+        assert self.conn
+        await self.ensure_user(owner_user_id)
+        await self._playlist_ensure_favorites_tx(int(owner_user_id))
+
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("empty_name")
+        if len(clean_name) > 40:
+            raise ValueError("too_long")
+
+        created_at = _now()
+        try:
+            cur = await self.conn.execute(
+                """
+                INSERT INTO playlists(owner_user_id, name, is_favorites, created_at)
+                VALUES(?,?,0,?)
+                """,
+                (int(owner_user_id), clean_name, created_at),
+            )
+            playlist_id = int(cur.lastrowid or 0)
+            await cur.close()
+            await self.conn.commit()
+        except aiosqlite.IntegrityError as exc:
+            await self.conn.rollback()
+            raise ValueError("duplicate_name") from exc
+
+        playlist = await self.playlist_get(int(owner_user_id), playlist_id)
+        if playlist is None:
+            raise RuntimeError("playlist_create_failed")
+        return playlist
+
+    async def playlist_add_track(
+        self,
+        owner_user_id: int,
+        playlist_id: int,
+        track_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        assert self.conn
+        await self.ensure_user(owner_user_id)
+        playlist = await self.playlist_get(int(owner_user_id), int(playlist_id))
+        if playlist is None:
+            raise ValueError("playlist_not_found")
+
+        cur = await self.conn.execute(
+            "SELECT COALESCE(MAX(track_position), 0) FROM playlist_tracks WHERE playlist_id=?",
+            (int(playlist_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        next_position = int((row[0] or 0) if row else 0) + 1
+
+        payload_obj = track_data.get("playable_payload") or {}
+        payload_text = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":"))
+        cur = await self.conn.execute(
+            """
+            INSERT INTO playlist_tracks(
+                playlist_id, track_position, source, source_track_ref, title, artist,
+                duration, artwork_url, canonical_url, playable_payload, created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(playlist_id),
+                next_position,
+                str(track_data.get("source") or ""),
+                str(track_data.get("source_track_ref") or track_data.get("canonical_url") or ""),
+                str(track_data.get("title") or ""),
+                str(track_data.get("artist") or ""),
+                int(track_data.get("duration") or 0),
+                str(track_data.get("artwork_url") or ""),
+                str(track_data.get("canonical_url") or ""),
+                payload_text,
+                _now(),
+            ),
+        )
+        inserted_id = int(cur.lastrowid or 0)
+        await cur.close()
+        await self.conn.commit()
+
+        cur = await self.conn.execute(
+            """
+            SELECT playlist_track_id, playlist_id, track_position, source, source_track_ref, title, artist,
+                   duration, artwork_url, canonical_url, playable_payload, created_at
+            FROM playlist_tracks
+            WHERE playlist_track_id=?
+            LIMIT 1
+            """,
+            (inserted_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        data = self._playlist_track_row_to_dict(row)
+        if data is None:
+            raise RuntimeError("playlist_track_insert_failed")
+        return data
+
+    async def playlist_tracks_list(self, owner_user_id: int, playlist_id: int) -> list[Dict[str, Any]]:
+        assert self.conn
+        playlist = await self.playlist_get(int(owner_user_id), int(playlist_id))
+        if playlist is None:
+            return []
+        cur = await self.conn.execute(
+            """
+            SELECT playlist_track_id, playlist_id, track_position, source, source_track_ref, title, artist,
+                   duration, artwork_url, canonical_url, playable_payload, created_at
+            FROM playlist_tracks
+            WHERE playlist_id=?
+            ORDER BY track_position ASC, playlist_track_id ASC
+            """,
+            (int(playlist_id),),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [self._playlist_track_row_to_dict(row) for row in rows if row is not None]
+
+    async def playlist_remove_tracks(
+        self,
+        owner_user_id: int,
+        playlist_id: int,
+        playlist_track_ids: list[int],
+    ) -> int:
+        assert self.conn
+        playlist = await self.playlist_get(int(owner_user_id), int(playlist_id))
+        if playlist is None:
+            return 0
+
+        ids = [int(x) for x in playlist_track_ids if int(x) > 0]
+        if not ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in ids)
+        try:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            cur = await self.conn.execute(
+                f"""
+                DELETE FROM playlist_tracks
+                WHERE playlist_id=? AND playlist_track_id IN ({placeholders})
+                """,
+                (int(playlist_id), *ids),
+            )
+            removed = int(cur.rowcount or 0)
+            await cur.close()
+
+            if removed > 0:
+                cur = await self.conn.execute(
+                    """
+                    SELECT playlist_track_id
+                    FROM playlist_tracks
+                    WHERE playlist_id=?
+                    ORDER BY track_position ASC, playlist_track_id ASC
+                    """,
+                    (int(playlist_id),),
+                )
+                rows = await cur.fetchall()
+                await cur.close()
+                for pos, row in enumerate(rows, start=1):
+                    await self.conn.execute(
+                        "UPDATE playlist_tracks SET track_position=? WHERE playlist_track_id=?",
+                        (int(pos), int(row[0])),
+                    )
+            await self.conn.commit()
+            return removed
+        except Exception:
+            await self.conn.rollback()
+            raise
+
     # ---------- Story ----------
 
     async def get_story(self, user_id: int) -> Dict[str, Any]:
@@ -1619,6 +2097,93 @@ CREATE TABLE IF NOT EXISTS tendrils(
         fields = dict(fields)
         fields["updated_ts"] = _now()
         await self.set_story_fields(user_id, **fields)
+
+    async def get_story_audio_resume(self, user_id: int) -> Optional[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT user_id, show_title, episode_title, category, audio_url, webpage_url,
+                   artwork_url, feed_url, episode_guid, duration_sec, resume_position_sec, updated_ts
+            FROM story_audio_resume
+            WHERE user_id=?
+            """,
+            (int(user_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return {
+            "user_id": int(row[0]),
+            "show_title": str(row[1] or ""),
+            "episode_title": str(row[2] or ""),
+            "category": str(row[3] or ""),
+            "audio_url": str(row[4] or ""),
+            "webpage_url": str(row[5] or ""),
+            "artwork_url": str(row[6] or ""),
+            "feed_url": str(row[7] or ""),
+            "episode_guid": str(row[8] or ""),
+            "duration_sec": int(row[9] or 0),
+            "resume_position_sec": int(row[10] or 0),
+            "updated_ts": int(row[11] or 0),
+        }
+
+    async def set_story_audio_resume(
+        self,
+        user_id: int,
+        *,
+        show_title: str,
+        episode_title: str,
+        category: str,
+        audio_url: str,
+        webpage_url: str = "",
+        artwork_url: str = "",
+        feed_url: str = "",
+        episode_guid: str = "",
+        duration_sec: int = 0,
+        resume_position_sec: int = 0,
+    ) -> None:
+        assert self.conn
+        await self.conn.execute(
+            """
+            INSERT INTO story_audio_resume(
+                user_id, show_title, episode_title, category, audio_url, webpage_url,
+                artwork_url, feed_url, episode_guid, duration_sec, resume_position_sec, updated_ts
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                show_title=excluded.show_title,
+                episode_title=excluded.episode_title,
+                category=excluded.category,
+                audio_url=excluded.audio_url,
+                webpage_url=excluded.webpage_url,
+                artwork_url=excluded.artwork_url,
+                feed_url=excluded.feed_url,
+                episode_guid=excluded.episode_guid,
+                duration_sec=excluded.duration_sec,
+                resume_position_sec=excluded.resume_position_sec,
+                updated_ts=excluded.updated_ts
+            """,
+            (
+                int(user_id),
+                str(show_title or ""),
+                str(episode_title or ""),
+                str(category or ""),
+                str(audio_url or ""),
+                str(webpage_url or ""),
+                str(artwork_url or ""),
+                str(feed_url or ""),
+                str(episode_guid or ""),
+                int(duration_sec or 0),
+                int(resume_position_sec or 0),
+                _now(),
+            ),
+        )
+        await self.conn.commit()
+
+    async def clear_story_audio_resume(self, user_id: int) -> None:
+        assert self.conn
+        await self.conn.execute("DELETE FROM story_audio_resume WHERE user_id=?", (int(user_id),))
+        await self.conn.commit()
 
     async def get_or_create_code(
         self,

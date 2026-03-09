@@ -532,7 +532,7 @@ class EchoPostsCog(commands.Cog, name="EchoPostsCog"):
                 await dm.send(
                     "✍️ **Смена имени канала**\n"
                     "Отправь новое имя (не длиннее 20 символов).\n"
-                    "РРјСЏ РґРѕР»Р¶РЅРѕ Р±С‹С‚СЊ СѓРЅРёРєР°Р»СЊРЅС‹Рј РЅР° СЃРµСЂРІРµСЂРµ.\n"
+                    "Имя должно быть уникальным на сервере.\n"
                     "Таймаут: 10 минут."
                 )
             else:
@@ -608,10 +608,10 @@ class EchoPostsCog(commands.Cog, name="EchoPostsCog"):
 
                 if action == "rename_name":
                     if not payload:
-                        await dm.send("вќЊ РРјСЏ РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РїСѓСЃС‚С‹Рј.")
+                        await dm.send("❌ Имя не может быть пустым.")
                         continue
                     if len(payload) > 20:
-                        await dm.send("вќЊ РРјСЏ РґР»РёРЅРЅРµРµ 20 СЃРёРјРІРѕР»РѕРІ. РџРѕРїСЂРѕР±СѓР№ СЃРЅРѕРІР°.")
+                        await dm.send("❌ Имя длиннее 20 символов. Попробуй снова.")
                         continue
 
                     safe_name = _sanitize_channel_name(payload, max_len=20)
@@ -646,10 +646,10 @@ class EchoPostsCog(commands.Cog, name="EchoPostsCog"):
                                 pass
                             u = await repo.get_user(user_id)
                             have = int(u.get("runes", 0))
-                            await dm.send(f"вќЊ РќРµ С…РІР°С‚Р°РµС‚ СЂСѓРЅ: **{have}/{cost}**. РРјСЏ РЅРµ РёР·РјРµРЅРµРЅРѕ.")
+                            await dm.send(f"❌ Не хватает рун: **{have}/{cost}**. Имя не изменено.")
                             return
 
-                    await dm.send(f"вњ… РРјСЏ РєР°РЅР°Р»Р° РѕР±РЅРѕРІР»РµРЅРѕ: `{safe_name}`. РЎРїРёСЃР°РЅРѕ **{cost}** СЂСѓРЅ.")
+                    await dm.send(f"✅ Имя канала обновлено: `{safe_name}`. Списано **{cost}** рун.")
                     return
 
                 # action == rename_topic
