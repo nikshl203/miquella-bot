@@ -308,6 +308,8 @@ class MusicCog(commands.Cog, name="MusicCog"):
             state_text = "Поток звука прерван."
         elif session is None:
             state_text = "Алтарь безмолвен. Ни один отголосок еще не был принесен."
+        elif session.state == "idle":
+            state_text = "Поток стих. Алтарь ждёт следующий трек."
         elif session.paused:
             state_text = "Звук удержан в тишине."
         elif session.state == "stopped":
@@ -331,6 +333,12 @@ class MusicCog(commands.Cog, name="MusicCog"):
             embed.add_field(
                 name="Сейчас звучит",
                 value=_track_lines(session.current_track, guild),
+                inline=False,
+            )
+        elif session and session.state == "idle":
+            embed.add_field(
+                name="Сейчас звучит",
+                value="Сейчас тишина. Алтарь ждёт следующий трек.",
                 inline=False,
             )
         else:
@@ -699,6 +707,17 @@ class MusicCog(commands.Cog, name="MusicCog"):
 
         vc.play(source, after=_after_playback)
 
+    async def _enter_idle_locked(self, *, state: str = "idle") -> None:
+        session = self.session
+        if session is None:
+            return
+        session.current_track = None
+        session.paused = False
+        session.state = state
+        if session.idle_disconnect_at == 0:
+            session.idle_disconnect_at = _now() + IDLE_DISCONNECT_SECONDS
+        self._last_panel_state = state
+
     async def _after_track_finished(self, error: Optional[Exception]) -> None:
         if error:
             log.warning("music playback after-callback error: %s", error)
@@ -708,15 +727,22 @@ class MusicCog(commands.Cog, name="MusicCog"):
                 return
             if session.suppress_after:
                 return
-            if session.queue:
-                session.current_track = session.queue.pop(0)
+            session.current_track = None
+            session.paused = False
+
+            while session.queue:
+                next_track = session.queue.pop(0)
+                session.current_track = next_track
+                session.state = "playing"
+                session.idle_disconnect_at = 0
                 try:
                     await self._play_current_locked()
+                    break
                 except Exception:
-                    log.exception("music next-track start failed")
-                    await self._close_session_locked(state="silent")
+                    log.exception("music next-track start failed: %s", next_track.title)
+                    session.current_track = None
             else:
-                await self._close_session_locked(state="silent")
+                await self._enter_idle_locked()
         await self._update_panel_message()
 
     async def _close_session_locked(self, *, state: str) -> None:
@@ -746,14 +772,17 @@ class MusicCog(commands.Cog, name="MusicCog"):
         if session is None:
             return
         listeners = self._non_bot_listeners()
-        if listeners:
+        vc = self._voice_client()
+        if not vc or not vc.is_connected():
+            return
+
+        should_idle = session.current_track is None or not listeners
+        if not should_idle:
             if session.idle_disconnect_at != 0:
                 session.idle_disconnect_at = 0
                 await self._update_panel_message()
             return
-        vc = self._voice_client()
-        if not vc or not vc.is_connected():
-            return
+
         if session.idle_disconnect_at == 0:
             session.idle_disconnect_at = _now() + IDLE_DISCONNECT_SECONDS
             await self._update_panel_message()
