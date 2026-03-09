@@ -9,7 +9,7 @@ from typing import Any, Optional
 import discord
 from discord.ext import commands, tasks
 
-from ._interactions import GuardedView, safe_edit_message, safe_send
+from ._interactions import GuardedView, safe_defer_ephemeral, safe_defer_update, safe_edit_message, safe_send
 
 
 def _digits(v: Any, default: int = 0) -> int:
@@ -820,6 +820,7 @@ class TendrilCog(commands.Cog):
     # ---------------- UI (ephemeral) ----------------
 
     async def ui_status(self, interaction: discord.Interaction) -> None:
+        await safe_defer_ephemeral(interaction)
         repo = self._repo()
         if not repo:
             return
@@ -868,6 +869,7 @@ class TendrilCog(commands.Cog):
         await safe_send(interaction, embed=e, ephemeral=True)
 
     async def ui_shield_status(self, interaction: discord.Interaction) -> None:
+        await safe_defer_ephemeral(interaction)
         repo = self._repo()
         if not repo:
             return
@@ -879,6 +881,7 @@ class TendrilCog(commands.Cog):
             await safe_send(interaction, "🛡️ Щита нет.", ephemeral=True)
 
     async def ui_buy_shield(self, interaction: discord.Interaction) -> None:
+        await safe_defer_ephemeral(interaction)
         repo = self._repo()
         if not repo:
             return
@@ -918,6 +921,7 @@ class TendrilCog(commands.Cog):
         )
 
     async def ui_remove_start(self, interaction: discord.Interaction) -> None:
+        await safe_defer_ephemeral(interaction)
         repo = self._repo()
         if not repo:
             return
@@ -984,6 +988,7 @@ class TendrilCog(commands.Cog):
         )
 
     async def ui_remove_pick(self, interaction: discord.Interaction, picked_sid: int, correct_sid: int) -> None:
+        await safe_defer_update(interaction)
         repo = self._repo()
         if not repo:
             return
@@ -1023,6 +1028,7 @@ class TendrilCog(commands.Cog):
             )
 
     async def ui_cast_start(self, interaction: discord.Interaction) -> None:
+        await safe_defer_ephemeral(interaction)
         repo = self._repo()
         if not repo:
             return
@@ -1126,6 +1132,7 @@ class TendrilCog(commands.Cog):
         await safe_send(interaction, embed=e, view=CastView(self, caster.id, opts, note=""), ephemeral=True)
 
     async def ui_cast_finish(self, interaction: discord.Interaction, target_id: int) -> None:
+        await safe_defer_update(interaction)
         repo = self._repo()
         if not repo:
             return

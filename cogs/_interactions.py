@@ -115,4 +115,4 @@ class GuardedView(discord.ui.View):
         /,
     ) -> None:
         log.exception("View callback failed: %s item=%s", type(self).__name__, type(item).__name__)
-        await safe_send(interaction, "⚠️ Ошибка взаимодействия. Попробуй ещё раз.", ephemeral=True)
+        await safe_send(interaction, "Ошибка взаимодействия. Попробуй еще раз.", ephemeral=True)

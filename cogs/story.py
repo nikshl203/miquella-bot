@@ -5,7 +5,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-from ._interactions import GuardedView, safe_send
+from ._interactions import GuardedView, safe_defer_ephemeral, safe_send
 from .story_ch1 import get_persistent_views as get_ch1_persistent_views
 from .story_ch1 import send_ch1_scene_1
 from .story_shared import ROOT, cfg as _cfg, get_or_create_story_thread as _get_or_create_story_thread, repo as _repo
@@ -50,6 +50,7 @@ async def _dm(member: discord.Member, content: str) -> bool:
 async def orderhall_issue_code(bot: commands.Bot, interaction: discord.Interaction, chapter_id: int) -> None:
     assert interaction.user and isinstance(interaction.user, discord.Member)
     member: discord.Member = interaction.user
+    await safe_defer_ephemeral(interaction)
 
     cfg = _cfg(bot)
     repo = _repo(bot)
@@ -114,6 +115,7 @@ async def orderhall_issue_code(bot: commands.Bot, interaction: discord.Interacti
 async def orderhall_replay_current(bot: commands.Bot, interaction: discord.Interaction) -> None:
     assert interaction.user and isinstance(interaction.user, discord.Member)
     member: discord.Member = interaction.user
+    await safe_defer_ephemeral(interaction)
     repo = _repo(bot)
     cfg = _cfg(bot)
 

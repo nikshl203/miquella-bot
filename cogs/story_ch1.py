@@ -5,7 +5,7 @@ import time
 import discord
 from discord.ext import commands
 
-from ._interactions import GuardedView, safe_send
+from ._interactions import GuardedView, safe_defer_ephemeral, safe_send
 from .story_shared import Ch1Attempt, cfg, disable_buttons, is_my_story_thread, load_attempt, repo, save_attempt
 
 
@@ -41,7 +41,11 @@ class Ch1Scene1View(GuardedView):
         self.bot = bot
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await is_my_story_thread(self.bot, interaction)
+        ok = await is_my_story_thread(self.bot, interaction)
+        if not ok:
+            await safe_send(interaction, "Это не твоя ветка истории.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="«Я пришёл учиться.»", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s1:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -73,6 +77,7 @@ async def send_ch1_scene_1(bot: commands.Bot, thread: discord.Thread, member: di
 
 
 async def ch1_apply_scene1(bot: commands.Bot, interaction: discord.Interaction, choice: int) -> None:
+    await safe_defer_ephemeral(interaction)
     if not isinstance(interaction.channel, discord.Thread):
         await safe_send(interaction, "Ошибка: история должна идти в треде.", ephemeral=True)
         return
@@ -100,7 +105,11 @@ class Ch1Scene2View(GuardedView):
         self.bot = bot
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await is_my_story_thread(self.bot, interaction)
+        ok = await is_my_story_thread(self.bot, interaction)
+        if not ok:
+            await safe_send(interaction, "Это не твоя ветка истории.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Назваться своим именем.", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s2:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -130,6 +139,7 @@ async def send_ch1_scene_2(bot: commands.Bot, thread: discord.Thread, user_id: i
 
 
 async def ch1_apply_scene2(bot: commands.Bot, interaction: discord.Interaction, choice: int) -> None:
+    await safe_defer_ephemeral(interaction)
     if not isinstance(interaction.channel, discord.Thread):
         await safe_send(interaction, "Ошибка: история должна идти в треде.", ephemeral=True)
         return
@@ -160,7 +170,11 @@ class Ch1Scene3View(GuardedView):
         self.bot = bot
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await is_my_story_thread(self.bot, interaction)
+        ok = await is_my_story_thread(self.bot, interaction)
+        if not ok:
+            await safe_send(interaction, "Это не твоя ветка истории.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Идти по разметке «проход».", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s3:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -190,6 +204,7 @@ async def send_ch1_scene_3(bot: commands.Bot, thread: discord.Thread, user_id: i
 
 
 async def ch1_apply_scene3(bot: commands.Bot, interaction: discord.Interaction, choice: int) -> None:
+    await safe_defer_ephemeral(interaction)
     if not isinstance(interaction.channel, discord.Thread):
         await safe_send(interaction, "Ошибка: история должна идти в треде.", ephemeral=True)
         return
@@ -256,7 +271,11 @@ class Ch1Scene4View(GuardedView):
         self.bot = bot
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await is_my_story_thread(self.bot, interaction)
+        ok = await is_my_story_thread(self.bot, interaction)
+        if not ok:
+            await safe_send(interaction, "Это не твоя ветка истории.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Забрать лист.", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s4:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -289,6 +308,7 @@ async def send_ch1_scene_4(bot: commands.Bot, thread: discord.Thread, user_id: i
 
 
 async def ch1_apply_scene4(bot: commands.Bot, interaction: discord.Interaction, choice: int) -> None:
+    await safe_defer_ephemeral(interaction)
     if not isinstance(interaction.channel, discord.Thread):
         await safe_send(interaction, "Ошибка: история должна идти в треде.", ephemeral=True)
         return
@@ -319,7 +339,11 @@ class Ch1Scene5View(GuardedView):
         self.bot = bot
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await is_my_story_thread(self.bot, interaction)
+        ok = await is_my_story_thread(self.bot, interaction)
+        if not ok:
+            await safe_send(interaction, "Это не твоя ветка истории.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Подписать «возвращаться».", style=discord.ButtonStyle.secondary, custom_id="story:ch1:s5:1")
     async def b1(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -398,6 +422,7 @@ async def _commit_ch1_success(bot: commands.Bot, user_id: int, att: Ch1Attempt) 
 
 
 async def ch1_apply_scene5(bot: commands.Bot, interaction: discord.Interaction, choice: int) -> None:
+    await safe_defer_ephemeral(interaction)
     if not isinstance(interaction.channel, discord.Thread):
         await safe_send(interaction, "Ошибка: история должна идти в треде.", ephemeral=True)
         return

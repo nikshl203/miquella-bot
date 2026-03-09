@@ -31,6 +31,8 @@ def _collect_views(bot: commands.Bot) -> List[discord.ui.View]:
         "cogs.echo_posts",
         "cogs.story",
         "cogs.tendril",
+        "cogs.orders",
+        "cogs.music",
     ):
         mod = _safe_import(mod_name)
         if not mod:

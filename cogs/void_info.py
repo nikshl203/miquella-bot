@@ -18,6 +18,17 @@ from .decorations import (
     Decoration,
 )
 
+ORDER_LABELS: dict[str, str] = {
+    "rher": "Орден Rher",
+    "sylvian": "Орден Sylvian",
+    "gro": "Орден Gro-Goroth",
+}
+ORDER_EMOJI: dict[str, str] = {
+    "rher": "🌙",
+    "sylvian": "🌿",
+    "gro": "🔥",
+}
+
 
 def _is_admin(bot: commands.Bot, user_id: int) -> bool:
     return bot.is_admin(user_id)  # type: ignore
@@ -209,6 +220,40 @@ async def _fetch_top10_by_runes(bot: commands.Bot, guild: Optional[discord.Guild
             break
 
     return out
+
+
+async def _build_order_influence_embed(bot: commands.Bot, guild: Optional[discord.Guild]) -> discord.Embed:
+    repo = bot.repo  # type: ignore
+    raw = await repo.order_all_influence()
+
+    rows: list[tuple[str, int]] = []
+    for oid in ("rher", "sylvian", "gro"):
+        rows.append((oid, int(raw.get(oid, 0))))
+    rows.sort(key=lambda x: x[1], reverse=True)
+
+    lines: list[str] = []
+    for i, (oid, influence) in enumerate(rows, start=1):
+        label = ORDER_LABELS.get(oid, oid)
+        emoji = ORDER_EMOJI.get(oid, "✦")
+        herald_text = "—"
+        try:
+            herald = await repo.order_get_herald(oid)
+            herald_id = int(herald.get("user_id", 0) or 0)
+            if herald_id > 0:
+                member = guild.get_member(herald_id) if guild else None
+                herald_text = member.mention if member else f"`{herald_id}`"
+        except Exception:
+            pass
+
+        lines.append(f"**{i}.** {emoji} {label} — **{influence}** влияния")
+        lines.append(f"Глашатай: {herald_text}")
+
+    emb = discord.Embed(
+        title="⚔️ Равновесие Орденов — топ по влиянию",
+        description="\n".join(lines) if lines else "Пока нет данных по влиянию орденов.",
+    )
+    emb.set_footer(text="Кнопка обновляет влияние и текущих глашатаев.")
+    return emb
 
 
 def _leaderboard_scope_ids(guild: Optional[discord.Guild]) -> set[int] | None:
@@ -591,8 +636,35 @@ class LeaderboardView(GuardedView):
             pass
 
 
+class OrdersInfluenceView(GuardedView):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)  # persistent
+        self.bot = bot
+
+    @discord.ui.button(
+        label="Обновить влияние орденов",
+        style=discord.ButtonStyle.secondary,
+        custom_id="void:refresh_order_influence",
+    )
+    async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button):
+        ok = await _safe_defer(interaction, ephemeral=True)
+        if not ok:
+            return
+
+        emb = await _build_order_influence_embed(self.bot, interaction.guild)
+        try:
+            await interaction.message.edit(embed=emb, view=self)
+        except Exception:
+            pass
+
+        try:
+            await interaction.followup.send("✅ Влияние орденов обновлено.", ephemeral=True)
+        except Exception:
+            pass
+
+
 def get_persistent_views(bot: commands.Bot):
-    return [VoidInfoView(bot), LeaderboardView(bot)]
+    return [VoidInfoView(bot), LeaderboardView(bot), OrdersInfluenceView(bot)]
 
 
 
@@ -601,10 +673,12 @@ class VoidInfoCog(commands.Cog):
         self.bot = bot
         self.info_view: Optional[VoidInfoView] = None
         self.lb_view: Optional[LeaderboardView] = None
+        self.order_inf_view: Optional[OrdersInfluenceView] = None
 
     async def cog_load(self) -> None:
         self.info_view = VoidInfoView(self.bot)
         self.lb_view = LeaderboardView(self.bot)
+        self.order_inf_view = OrdersInfluenceView(self.bot)
 
     @commands.command(name="post_void_panels")
     async def post_void_panels(self, ctx: commands.Context) -> None:
@@ -620,6 +694,7 @@ class VoidInfoCog(commands.Cog):
 
         assert self.info_view is not None
         assert self.lb_view is not None
+        assert self.order_inf_view is not None
 
         emb1 = discord.Embed(
             title="🕳️ Информация Пустоты",
@@ -651,6 +726,13 @@ class VoidInfoCog(commands.Cog):
         m2 = await ch.send(embed=emb2, view=self.lb_view)
         try:
             await m2.pin()
+        except Exception:
+            pass
+
+        emb3 = await _build_order_influence_embed(self.bot, ctx.guild)
+        m3 = await ch.send(embed=emb3, view=self.order_inf_view)
+        try:
+            await m3.pin()
         except Exception:
             pass
 

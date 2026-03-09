@@ -13,7 +13,7 @@ import discord
 from discord.ext import commands
 from PIL import Image
 
-from ._interactions import GuardedView, safe_send
+from ._interactions import GuardedView, safe_defer_ephemeral, safe_send
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "assets" / "duel"
@@ -673,6 +673,7 @@ class LobbyView(GuardedView):
 
     @discord.ui.button(label="🎣 Пудж", style=discord.ButtonStyle.secondary)
     async def take_pudge(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await safe_defer_ephemeral(interaction)
         lvl = await self.cog._get_level(interaction.user.id)
         if not can_play_duel(lvl) and not self.cog._is_admin(interaction.user.id):
             await safe_send(interaction, "⛓️ Тебе ещё рано для дуэли (15+).", ephemeral=True)
@@ -696,6 +697,7 @@ class LobbyView(GuardedView):
 
     @discord.ui.button(label="❄️ ЦМ", style=discord.ButtonStyle.secondary)
     async def take_cm(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await safe_defer_ephemeral(interaction)
         lvl = await self.cog._get_level(interaction.user.id)
         if not can_play_duel(lvl) and not self.cog._is_admin(interaction.user.id):
             await safe_send(interaction, "⛓️ Тебе ещё рано для дуэли (15+).", ephemeral=True)
@@ -747,6 +749,7 @@ class ProposerPickButton(GuardedView):
 
     @discord.ui.button(label="Выбрать ставку", style=discord.ButtonStyle.primary)
     async def pick(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await safe_defer_ephemeral(interaction)
         if interaction.user.id != self.proposer_id:
             await safe_send(interaction, "⚠️ Ставку выбирает другой игрок.", ephemeral=True)
             return

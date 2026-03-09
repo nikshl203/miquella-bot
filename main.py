@@ -75,6 +75,8 @@ class VoidBot(commands.Bot):
             "cogs.coin",
             "cogs.story",
             "cogs.duel",
+            "cogs.orders",
+            "cogs.music",
             "cogs.persistent",
         ]
 

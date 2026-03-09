@@ -178,6 +178,81 @@ CREATE TABLE IF NOT EXISTS tendrils(
                 free_praises_used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(user_id, date)
             );
+
+            CREATE TABLE IF NOT EXISTS order_members(
+                user_id INTEGER PRIMARY KEY,
+                order_id TEXT NOT NULL,
+                joined_ts INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS order_influence(
+                order_id TEXT PRIMARY KEY,
+                influence INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS order_herald(
+                order_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL DEFAULT 0,
+                elected_ts INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS order_elections(
+                order_id TEXT PRIMARY KEY,
+                stage TEXT NOT NULL DEFAULT '',
+                started_ts INTEGER NOT NULL DEFAULT 0,
+                collect_deadline_ts INTEGER NOT NULL DEFAULT 0,
+                vote_deadline_ts INTEGER NOT NULL DEFAULT 0,
+                last_finished_ts INTEGER NOT NULL DEFAULT 0,
+                collect_message_id INTEGER NOT NULL DEFAULT 0,
+                vote_message_id INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS order_election_candidates(
+                order_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                willing INTEGER NOT NULL DEFAULT 0,
+                applied_ts INTEGER NOT NULL DEFAULT 0,
+                responded_ts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(order_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS order_election_votes(
+                order_id TEXT NOT NULL,
+                voter_user_id INTEGER NOT NULL,
+                candidate_user_id INTEGER NOT NULL,
+                voted_ts INTEGER NOT NULL,
+                PRIMARY KEY(order_id, voter_user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS order_wars(
+                war_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attacker_order_id TEXT NOT NULL,
+                defender_order_id TEXT NOT NULL,
+                game_name TEXT NOT NULL,
+                needed_count INTEGER NOT NULL,
+                match_note TEXT NOT NULL DEFAULT '',
+                started_by_user_id INTEGER NOT NULL,
+                stage TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                attacker_deadline_ts INTEGER NOT NULL DEFAULT 0,
+                defender_deadline_ts INTEGER NOT NULL DEFAULT 0,
+                attacker_letter_message_id INTEGER NOT NULL DEFAULT 0,
+                attacker_status_message_id INTEGER NOT NULL DEFAULT 0,
+                defender_letter_message_id INTEGER NOT NULL DEFAULT 0,
+                defender_status_message_id INTEGER NOT NULL DEFAULT 0,
+                resolved_ts INTEGER NOT NULL DEFAULT 0,
+                result_order_id TEXT NOT NULL DEFAULT '',
+                cancel_reason TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS order_war_responses(
+                war_id INTEGER NOT NULL,
+                order_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                ready INTEGER NOT NULL DEFAULT 0,
+                updated_ts INTEGER NOT NULL,
+                PRIMARY KEY(war_id, order_id, user_id)
+            );
             """
         )
 
@@ -279,6 +354,86 @@ CREATE TABLE IF NOT EXISTS tendrils(
                 posts_praised_count INTEGER NOT NULL DEFAULT 0,
                 free_praises_used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(user_id, date)
+            );
+            """
+        )
+
+        # ---- orders / herald elections / wars ----
+        await self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS order_members(
+                user_id INTEGER PRIMARY KEY,
+                order_id TEXT NOT NULL,
+                joined_ts INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS order_influence(
+                order_id TEXT PRIMARY KEY,
+                influence INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS order_herald(
+                order_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL DEFAULT 0,
+                elected_ts INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS order_elections(
+                order_id TEXT PRIMARY KEY,
+                stage TEXT NOT NULL DEFAULT '',
+                started_ts INTEGER NOT NULL DEFAULT 0,
+                collect_deadline_ts INTEGER NOT NULL DEFAULT 0,
+                vote_deadline_ts INTEGER NOT NULL DEFAULT 0,
+                last_finished_ts INTEGER NOT NULL DEFAULT 0,
+                collect_message_id INTEGER NOT NULL DEFAULT 0,
+                vote_message_id INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS order_election_candidates(
+                order_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                willing INTEGER NOT NULL DEFAULT 0,
+                applied_ts INTEGER NOT NULL DEFAULT 0,
+                responded_ts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(order_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS order_election_votes(
+                order_id TEXT NOT NULL,
+                voter_user_id INTEGER NOT NULL,
+                candidate_user_id INTEGER NOT NULL,
+                voted_ts INTEGER NOT NULL,
+                PRIMARY KEY(order_id, voter_user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS order_wars(
+                war_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attacker_order_id TEXT NOT NULL,
+                defender_order_id TEXT NOT NULL,
+                game_name TEXT NOT NULL,
+                needed_count INTEGER NOT NULL,
+                match_note TEXT NOT NULL DEFAULT '',
+                started_by_user_id INTEGER NOT NULL,
+                stage TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                attacker_deadline_ts INTEGER NOT NULL DEFAULT 0,
+                defender_deadline_ts INTEGER NOT NULL DEFAULT 0,
+                attacker_letter_message_id INTEGER NOT NULL DEFAULT 0,
+                attacker_status_message_id INTEGER NOT NULL DEFAULT 0,
+                defender_letter_message_id INTEGER NOT NULL DEFAULT 0,
+                defender_status_message_id INTEGER NOT NULL DEFAULT 0,
+                resolved_ts INTEGER NOT NULL DEFAULT 0,
+                result_order_id TEXT NOT NULL DEFAULT '',
+                cancel_reason TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS order_war_responses(
+                war_id INTEGER NOT NULL,
+                order_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                ready INTEGER NOT NULL DEFAULT 0,
+                updated_ts INTEGER NOT NULL,
+                PRIMARY KEY(war_id, order_id, user_id)
             );
             """
         )
@@ -853,6 +1008,545 @@ CREATE TABLE IF NOT EXISTS tendrils(
                 int(paid_runes_delta),
                 int(posts_delta),
                 int(free_delta),
+            ),
+        )
+        await self.conn.commit()
+
+    # ---------- Orders / Herald / Wars ----------
+
+    async def order_get_user(self, user_id: int) -> str:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT order_id FROM order_members WHERE user_id=?",
+            (int(user_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return ""
+        return str(row[0] or "")
+
+    async def order_join(self, user_id: int, order_id: str) -> bool:
+        """
+        Join user to an order exactly once.
+        Returns:
+          True  -> joined now OR already in this same order
+          False -> user already in another order
+        """
+        assert self.conn
+        await self.ensure_user(user_id)
+        oid = str(order_id).strip().lower()
+        cur = await self.conn.execute(
+            "SELECT order_id FROM order_members WHERE user_id=?",
+            (int(user_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+
+        if row:
+            have = str(row[0] or "").strip().lower()
+            return have == oid
+
+        await self.conn.execute(
+            "INSERT INTO order_members(user_id, order_id, joined_ts) VALUES(?,?,?)",
+            (int(user_id), oid, _now()),
+        )
+        await self.conn.commit()
+        return True
+
+    async def order_member_ids_from_db(self, order_id: str) -> list[int]:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT user_id FROM order_members WHERE order_id=?",
+            (str(order_id).strip().lower(),),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [int(r[0]) for r in rows]
+
+    async def order_get_influence(self, order_id: str) -> int:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO order_influence(order_id, influence) VALUES(?, 0)",
+            (oid,),
+        )
+        cur = await self.conn.execute(
+            "SELECT influence FROM order_influence WHERE order_id=?",
+            (oid,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        await self.conn.commit()
+        if not row:
+            return 0
+        return int(row[0] or 0)
+
+    async def order_add_influence(self, order_id: str, delta: int) -> int:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        d = int(delta)
+        await self.conn.execute(
+            """
+            INSERT INTO order_influence(order_id, influence)
+            VALUES(?, ?)
+            ON CONFLICT(order_id) DO UPDATE SET influence = influence + excluded.influence
+            """,
+            (oid, d),
+        )
+        cur = await self.conn.execute(
+            "SELECT influence FROM order_influence WHERE order_id=?",
+            (oid,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        await self.conn.commit()
+        return int(row[0] if row else 0)
+
+    async def order_all_influence(self) -> dict[str, int]:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT order_id, influence FROM order_influence"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return {str(r[0]): int(r[1]) for r in rows}
+
+    async def order_get_herald(self, order_id: str) -> dict[str, int]:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        cur = await self.conn.execute(
+            "SELECT user_id, elected_ts FROM order_herald WHERE order_id=?",
+            (oid,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return {"user_id": 0, "elected_ts": 0}
+        return {"user_id": int(row[0] or 0), "elected_ts": int(row[1] or 0)}
+
+    async def order_set_herald(self, order_id: str, user_id: int) -> None:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        await self.conn.execute(
+            """
+            INSERT INTO order_herald(order_id, user_id, elected_ts)
+            VALUES(?,?,?)
+            ON CONFLICT(order_id) DO UPDATE SET
+                user_id=excluded.user_id,
+                elected_ts=excluded.elected_ts
+            """,
+            (oid, int(user_id), _now()),
+        )
+        await self.conn.commit()
+
+    async def order_get_election(self, order_id: str) -> Optional[Dict[str, Any]]:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        cur = await self.conn.execute(
+            """
+            SELECT order_id, stage, started_ts, collect_deadline_ts, vote_deadline_ts,
+                   last_finished_ts, collect_message_id, vote_message_id
+            FROM order_elections WHERE order_id=?
+            """,
+            (oid,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return {
+            "order_id": str(row[0]),
+            "stage": str(row[1] or ""),
+            "started_ts": int(row[2] or 0),
+            "collect_deadline_ts": int(row[3] or 0),
+            "vote_deadline_ts": int(row[4] or 0),
+            "last_finished_ts": int(row[5] or 0),
+            "collect_message_id": int(row[6] or 0),
+            "vote_message_id": int(row[7] or 0),
+        }
+
+    async def order_upsert_election(self, order_id: str, **fields: Any) -> None:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO order_elections(order_id) VALUES(?)",
+            (oid,),
+        )
+        if fields:
+            keys = list(fields.keys())
+            vals = [fields[k] for k in keys]
+            set_clause = ", ".join(f"{k}=?" for k in keys)
+            await self.conn.execute(
+                f"UPDATE order_elections SET {set_clause} WHERE order_id=?",
+                (*vals, oid),
+            )
+        await self.conn.commit()
+
+    async def order_active_elections(self) -> list[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT order_id, stage, started_ts, collect_deadline_ts, vote_deadline_ts,
+                   last_finished_ts, collect_message_id, vote_message_id
+            FROM order_elections
+            WHERE stage IN ('collect', 'vote')
+            """
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        out: list[Dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "order_id": str(row[0]),
+                    "stage": str(row[1] or ""),
+                    "started_ts": int(row[2] or 0),
+                    "collect_deadline_ts": int(row[3] or 0),
+                    "vote_deadline_ts": int(row[4] or 0),
+                    "last_finished_ts": int(row[5] or 0),
+                    "collect_message_id": int(row[6] or 0),
+                    "vote_message_id": int(row[7] or 0),
+                }
+            )
+        return out
+
+    async def order_election_set_candidate(self, order_id: str, user_id: int, willing: bool) -> None:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        uid = int(user_id)
+        now = _now()
+        w = 1 if bool(willing) else 0
+        applied = now if w == 1 else 0
+        await self.conn.execute(
+            """
+            INSERT INTO order_election_candidates(order_id, user_id, willing, applied_ts, responded_ts)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(order_id, user_id) DO UPDATE SET
+                willing=excluded.willing,
+                responded_ts=excluded.responded_ts,
+                applied_ts=CASE
+                    WHEN excluded.willing=1 AND order_election_candidates.applied_ts=0
+                    THEN excluded.applied_ts
+                    ELSE order_election_candidates.applied_ts
+                END
+            """,
+            (oid, uid, w, applied, now),
+        )
+        await self.conn.commit()
+
+    async def order_election_candidates(self, order_id: str) -> list[Dict[str, Any]]:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        cur = await self.conn.execute(
+            """
+            SELECT user_id, willing, applied_ts, responded_ts
+            FROM order_election_candidates
+            WHERE order_id=?
+            """,
+            (oid,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {
+                "user_id": int(r[0]),
+                "willing": int(r[1]),
+                "applied_ts": int(r[2] or 0),
+                "responded_ts": int(r[3] or 0),
+            }
+            for r in rows
+        ]
+
+    async def order_election_set_vote(self, order_id: str, voter_user_id: int, candidate_user_id: int) -> None:
+        assert self.conn
+        await self.conn.execute(
+            """
+            INSERT INTO order_election_votes(order_id, voter_user_id, candidate_user_id, voted_ts)
+            VALUES(?,?,?,?)
+            ON CONFLICT(order_id, voter_user_id) DO UPDATE SET
+                candidate_user_id=excluded.candidate_user_id,
+                voted_ts=excluded.voted_ts
+            """,
+            (
+                str(order_id).strip().lower(),
+                int(voter_user_id),
+                int(candidate_user_id),
+                _now(),
+            ),
+        )
+        await self.conn.commit()
+
+    async def order_election_votes(self, order_id: str) -> list[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT voter_user_id, candidate_user_id, voted_ts
+            FROM order_election_votes
+            WHERE order_id=?
+            """,
+            (str(order_id).strip().lower(),),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {
+                "voter_user_id": int(r[0]),
+                "candidate_user_id": int(r[1]),
+                "voted_ts": int(r[2] or 0),
+            }
+            for r in rows
+        ]
+
+    async def order_election_reset_runtime(self, order_id: str, *, stage: str, last_finished_ts: int) -> None:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        await self.conn.execute(
+            "DELETE FROM order_election_candidates WHERE order_id=?",
+            (oid,),
+        )
+        await self.conn.execute(
+            "DELETE FROM order_election_votes WHERE order_id=?",
+            (oid,),
+        )
+        await self.order_upsert_election(
+            oid,
+            stage=str(stage),
+            collect_deadline_ts=0,
+            vote_deadline_ts=0,
+            collect_message_id=0,
+            vote_message_id=0,
+            last_finished_ts=int(last_finished_ts),
+        )
+        await self.conn.commit()
+
+    async def order_create_war(
+        self,
+        *,
+        attacker_order_id: str,
+        defender_order_id: str,
+        game_name: str,
+        needed_count: int,
+        match_note: str,
+        started_by_user_id: int,
+        stage: str,
+        attacker_deadline_ts: int,
+    ) -> int:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            INSERT INTO order_wars(
+                attacker_order_id, defender_order_id, game_name, needed_count, match_note,
+                started_by_user_id, stage, created_ts, attacker_deadline_ts
+            )
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(attacker_order_id).strip().lower(),
+                str(defender_order_id).strip().lower(),
+                str(game_name),
+                int(needed_count),
+                str(match_note),
+                int(started_by_user_id),
+                str(stage),
+                _now(),
+                int(attacker_deadline_ts),
+            ),
+        )
+        war_id = int(cur.lastrowid or 0)
+        await cur.close()
+        await self.conn.commit()
+        return war_id
+
+    async def order_get_war(self, war_id: int) -> Optional[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT war_id, attacker_order_id, defender_order_id, game_name, needed_count, match_note,
+                   started_by_user_id, stage, created_ts, attacker_deadline_ts, defender_deadline_ts,
+                   attacker_letter_message_id, attacker_status_message_id,
+                   defender_letter_message_id, defender_status_message_id,
+                   resolved_ts, result_order_id, cancel_reason
+            FROM order_wars WHERE war_id=?
+            """,
+            (int(war_id),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return {
+            "war_id": int(row[0]),
+            "attacker_order_id": str(row[1]),
+            "defender_order_id": str(row[2]),
+            "game_name": str(row[3]),
+            "needed_count": int(row[4]),
+            "match_note": str(row[5] or ""),
+            "started_by_user_id": int(row[6]),
+            "stage": str(row[7]),
+            "created_ts": int(row[8]),
+            "attacker_deadline_ts": int(row[9] or 0),
+            "defender_deadline_ts": int(row[10] or 0),
+            "attacker_letter_message_id": int(row[11] or 0),
+            "attacker_status_message_id": int(row[12] or 0),
+            "defender_letter_message_id": int(row[13] or 0),
+            "defender_status_message_id": int(row[14] or 0),
+            "resolved_ts": int(row[15] or 0),
+            "result_order_id": str(row[16] or ""),
+            "cancel_reason": str(row[17] or ""),
+        }
+
+    async def order_update_war(self, war_id: int, **fields: Any) -> None:
+        assert self.conn
+        if not fields:
+            return
+        keys = list(fields.keys())
+        vals = [fields[k] for k in keys]
+        set_clause = ", ".join(f"{k}=?" for k in keys)
+        await self.conn.execute(
+            f"UPDATE order_wars SET {set_clause} WHERE war_id=?",
+            (*vals, int(war_id)),
+        )
+        await self.conn.commit()
+
+    async def order_active_wars(self) -> list[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT war_id, attacker_order_id, defender_order_id, game_name, needed_count, match_note,
+                   started_by_user_id, stage, created_ts, attacker_deadline_ts, defender_deadline_ts,
+                   attacker_letter_message_id, attacker_status_message_id,
+                   defender_letter_message_id, defender_status_message_id,
+                   resolved_ts, result_order_id, cancel_reason
+            FROM order_wars
+            WHERE stage IN ('collect_attacker', 'collect_defender')
+            ORDER BY war_id ASC
+            """
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        out: list[Dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "war_id": int(row[0]),
+                    "attacker_order_id": str(row[1]),
+                    "defender_order_id": str(row[2]),
+                    "game_name": str(row[3]),
+                    "needed_count": int(row[4]),
+                    "match_note": str(row[5] or ""),
+                    "started_by_user_id": int(row[6]),
+                    "stage": str(row[7]),
+                    "created_ts": int(row[8]),
+                    "attacker_deadline_ts": int(row[9] or 0),
+                    "defender_deadline_ts": int(row[10] or 0),
+                    "attacker_letter_message_id": int(row[11] or 0),
+                    "attacker_status_message_id": int(row[12] or 0),
+                    "defender_letter_message_id": int(row[13] or 0),
+                    "defender_status_message_id": int(row[14] or 0),
+                    "resolved_ts": int(row[15] or 0),
+                    "result_order_id": str(row[16] or ""),
+                    "cancel_reason": str(row[17] or ""),
+                }
+            )
+        return out
+
+    async def order_has_active_war_for(self, order_id: str) -> bool:
+        assert self.conn
+        oid = str(order_id).strip().lower()
+        cur = await self.conn.execute(
+            """
+            SELECT 1
+            FROM order_wars
+            WHERE stage IN ('collect_attacker', 'collect_defender', 'confirmed')
+              AND (attacker_order_id=? OR defender_order_id=?)
+            LIMIT 1
+            """,
+            (oid, oid),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return bool(row)
+
+    async def order_last_war_attack_ts(self, attacker_order_id: str) -> int:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT MAX(created_ts)
+            FROM order_wars
+            WHERE attacker_order_id=?
+            """,
+            (str(attacker_order_id).strip().lower(),),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return 0
+        return int(row[0] or 0)
+
+    async def order_set_war_response(self, war_id: int, order_id: str, user_id: int, ready: bool) -> None:
+        assert self.conn
+        await self.conn.execute(
+            """
+            INSERT INTO order_war_responses(war_id, order_id, user_id, ready, updated_ts)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(war_id, order_id, user_id) DO UPDATE SET
+                ready=excluded.ready,
+                updated_ts=excluded.updated_ts
+            """,
+            (
+                int(war_id),
+                str(order_id).strip().lower(),
+                int(user_id),
+                1 if bool(ready) else 0,
+                _now(),
+            ),
+        )
+        await self.conn.commit()
+
+    async def order_get_war_responses(self, war_id: int, order_id: str) -> list[Dict[str, Any]]:
+        assert self.conn
+        cur = await self.conn.execute(
+            """
+            SELECT user_id, ready, updated_ts
+            FROM order_war_responses
+            WHERE war_id=? AND order_id=?
+            ORDER BY updated_ts ASC
+            """,
+            (int(war_id), str(order_id).strip().lower()),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {
+                "user_id": int(r[0]),
+                "ready": int(r[1]),
+                "updated_ts": int(r[2] or 0),
+            }
+            for r in rows
+        ]
+
+    async def order_finish_war(
+        self,
+        war_id: int,
+        *,
+        stage: str,
+        cancel_reason: str = "",
+        result_order_id: str = "",
+    ) -> None:
+        assert self.conn
+        await self.conn.execute(
+            """
+            UPDATE order_wars
+            SET stage=?, cancel_reason=?, result_order_id=?, resolved_ts=?
+            WHERE war_id=?
+            """,
+            (
+                str(stage),
+                str(cancel_reason),
+                str(result_order_id).strip().lower(),
+                _now(),
+                int(war_id),
             ),
         )
         await self.conn.commit()
