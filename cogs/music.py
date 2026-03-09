@@ -57,6 +57,10 @@ class MusicSession:
     suppress_after: bool = False
 
 
+class PreviewOnlyTrackError(RuntimeError):
+    """Raised when SoundCloud exposes only preview snippets for a track."""
+
+
 def _now() -> int:
     return int(time.time())
 
@@ -91,6 +95,26 @@ def _ffmpeg_path() -> str:
         except Exception:
             return ""
     return ""
+
+
+PREVIEW_ONLY_TRACK_TEXT = (
+    "Этот отголосок доступен лишь как краткое превью. "
+    "Алтарь не может принять его целиком."
+)
+
+
+def _soundcloud_format_is_preview(fmt: dict) -> bool:
+    format_id = str(fmt.get("format_id") or "").lower()
+    format_note = str(fmt.get("format_note") or "").lower()
+    url = str(fmt.get("url") or "").lower()
+    preference = fmt.get("preference")
+    return (
+        "preview" in format_id
+        or "preview" in format_note
+        or preference == -10
+        or "/preview/" in url
+        or "/playlist/0/30/" in url
+    )
 
 
 def _track_lines(track: MusicTrack, guild: Optional[discord.Guild]) -> str:
@@ -475,6 +499,13 @@ class MusicCog(commands.Cog, name="MusicCog"):
 
             try:
                 track = await self._resolve_track(query, requested_by_user_id=member.id)
+            except PreviewOnlyTrackError as exc:
+                if self.session and self.session.current_track is None and not self.session.queue:
+                    self.session = None
+                    self._last_panel_state = "silent"
+                await safe_send(interaction, str(exc), ephemeral=True)
+                await self._update_panel_message()
+                return
             except Exception as exc:
                 await safe_send(interaction, f"Не удалось призвать трек: {exc}", ephemeral=True)
                 return
@@ -639,7 +670,49 @@ class MusicCog(commands.Cog, name="MusicCog"):
             ):
                 raise RuntimeError("Первая версия принимает только треки SoundCloud.")
 
+            # SoundCloud formats marked by yt-dlp as "..._preview" / preference=-10
+            # are 30-second snippets. Reject tracks when all available audio formats
+            # are preview-only, before they ever enter the queue.
+            audio_formats = [
+                fmt
+                for fmt in (entry.get("formats") or [])
+                if fmt.get("vcodec") == "none" and fmt.get("url")
+            ]
+            preview_formats = [fmt for fmt in audio_formats if _soundcloud_format_is_preview(fmt)]
+            playable_formats = [fmt for fmt in audio_formats if not _soundcloud_format_is_preview(fmt)]
+
+            selected_format = {
+                "format_id": entry.get("format_id"),
+                "format_note": entry.get("format_note"),
+                "preference": entry.get("preference"),
+                "url": entry.get("url"),
+            }
+            selected_is_preview = _soundcloud_format_is_preview(selected_format)
+
+            if (audio_formats and not playable_formats) or (not audio_formats and selected_is_preview):
+                title = str(entry.get("title") or "unknown")
+                selected_format_id = str(entry.get("format_id") or "unknown")
+                log.info(
+                    "Rejected SoundCloud preview-only track '%s': selected_format=%s, "
+                    "audio_formats=%d, preview_formats=%d",
+                    title,
+                    selected_format_id,
+                    len(audio_formats),
+                    len(preview_formats),
+                )
+                raise PreviewOnlyTrackError(PREVIEW_ONLY_TRACK_TEXT)
+
             stream_url = str(entry.get("url") or "")
+            if (not stream_url or selected_is_preview) and playable_formats:
+                best_playable = playable_formats[-1]
+                stream_url = str(best_playable.get("url") or "")
+                if selected_is_preview:
+                    log.debug(
+                        "Switching SoundCloud track '%s' from preview format %s to playable format %s",
+                        str(entry.get("title") or "unknown"),
+                        str(entry.get("format_id") or "unknown"),
+                        str(best_playable.get("format_id") or "unknown"),
+                    )
             if not stream_url:
                 raise RuntimeError("Не удалось получить поток трека.")
 
