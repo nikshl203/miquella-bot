@@ -74,6 +74,7 @@ class VoidBot(commands.Bot):
             "cogs.tendril",
             "cogs.coin",
             "cogs.story",
+            "cogs.story_hall",
             "cogs.duel",
             "cogs.orders",
             "cogs.music",

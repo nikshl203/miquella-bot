@@ -50,45 +50,45 @@ CATEGORY_DEFS: dict[str, dict[str, Any]] = {
     "stories": {
         "label": "Истории",
         "queries": (
-            "short stories podcast",
-            "storytelling podcast",
-            "audio drama podcast",
+            "истории подкаст",
+            "аудиорассказы",
+            "рассказы вслух",
         ),
         "group": "stories",
     },
     "horror": {
         "label": "Страшные истории",
         "queries": (
-            "horror stories podcast",
-            "scary stories podcast",
-            "creepypasta podcast",
+            "страшные истории подкаст",
+            "мистические истории подкаст",
+            "ужасы подкаст",
         ),
         "group": "stories",
     },
     "fairy": {
         "label": "Сказки",
         "queries": (
-            "fairy tales podcast",
-            "bedtime stories podcast",
-            "folk tales podcast",
+            "сказки подкаст",
+            "русские сказки подкаст",
+            "сказки для детей подкаст",
         ),
         "group": "stories",
     },
     "podcasts": {
         "label": "Подкасты",
         "queries": (
-            "interview podcast",
-            "conversation podcast",
-            "talk podcast",
+            "русский подкаст",
+            "разговорный подкаст",
+            "подкаст интервью",
         ),
         "group": "podcasts",
     },
     "educational": {
         "label": "Познавательное",
         "queries": (
-            "science podcast",
-            "history podcast",
-            "educational podcast",
+            "научпоп подкаст",
+            "история подкаст",
+            "образовательный подкаст",
         ),
         "group": "podcasts",
     },
@@ -146,6 +146,15 @@ def _parse_duration(value: str) -> int:
     if len(nums) == 2:
         return nums[0] * 60 + nums[1]
     return 0
+
+
+def _has_cyrillic(text: str) -> bool:
+    return bool(re.search(r"[А-Яа-яЁё]", str(text or "")))
+
+
+def _is_russian_lang(value: str) -> bool:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    return raw.startswith("ru")
 
 
 def _find_first_text(parent: ET.Element, *names: str) -> str:
@@ -486,6 +495,7 @@ class StoryHallCog(commands.Cog, name="StoryHallCog"):
         self._ffmpeg = _ffmpeg_path()
         self._show_cache: dict[tuple[str, int], tuple[float, list[StoryShow]]] = {}
         self._feed_cache: dict[tuple[str, str, str, int], tuple[float, list[StoryEpisode]]] = {}
+        self._feed_language_cache: dict[str, tuple[float, bool]] = {}
         self._recent_episode_ids: list[str] = []
 
     async def cog_load(self) -> None:
@@ -740,6 +750,73 @@ class StoryHallCog(commands.Cog, name="StoryHallCog"):
 
         return json.loads(payload.decode("utf-8"))
 
+    def _feed_is_russian_sync(self, feed_url: str) -> bool:
+        cached = self._feed_language_cache.get(feed_url)
+        now = time.monotonic()
+        if cached and cached[0] > now:
+            return bool(cached[1])
+
+        payload = self._http_bytes_sync(
+            feed_url,
+            accept="application/rss+xml, application/xml, text/xml, application/atom+xml;q=0.9, */*;q=0.8",
+        )
+        root = ET.fromstring(payload)
+        root_name = _local_name(root.tag)
+
+        result = False
+        if root_name == "rss":
+            channel = next((child for child in list(root) if _local_name(child.tag) == "channel"), None)
+            if channel is not None:
+                language = _find_first_text(channel, "language")
+                if _is_russian_lang(language):
+                    result = True
+                else:
+                    probe_parts = [_find_first_text(channel, "title"), _find_first_text(channel, "description")]
+                    item_titles: list[str] = []
+                    for child in list(channel):
+                        if _local_name(child.tag) != "item":
+                            continue
+                        title = _find_first_text(child, "title")
+                        if title:
+                            item_titles.append(title)
+                        if len(item_titles) >= 3:
+                            break
+                    result = any(_has_cyrillic(part) for part in [*probe_parts, *item_titles] if part)
+        elif root_name == "feed":
+            xml_lang = str(root.attrib.get("{http://www.w3.org/XML/1998/namespace}lang") or "").strip()
+            if _is_russian_lang(xml_lang):
+                result = True
+            else:
+                probe_parts = [_find_first_text(root, "title"), _find_first_text(root, "subtitle")]
+                entry_titles: list[str] = []
+                for child in list(root):
+                    if _local_name(child.tag) != "entry":
+                        continue
+                    title = _find_first_text(child, "title")
+                    if title:
+                        entry_titles.append(title)
+                    if len(entry_titles) >= 3:
+                        break
+                result = any(_has_cyrillic(part) for part in [*probe_parts, *entry_titles] if part)
+
+        self._feed_language_cache[feed_url] = (now + FEED_CACHE_TTL, result)
+        return result
+
+    async def _filter_russian_shows(self, shows: list[StoryShow], *, limit: int) -> list[StoryShow]:
+        filtered: list[StoryShow] = []
+        for show in shows:
+            try:
+                is_russian = await asyncio.to_thread(self._feed_is_russian_sync, show.feed_url)
+            except Exception as exc:
+                log.info("story hall skipped show feed=%r language_probe_failed=%s", show.feed_url, exc)
+                continue
+            if not is_russian:
+                continue
+            filtered.append(show)
+            if len(filtered) >= limit:
+                break
+        return filtered
+
     async def _search_shows(self, query: str, *, limit: int = SHOW_SEARCH_LIMIT) -> list[StoryShow]:
         key = (str(query or "").strip().lower(), int(limit))
         cached = self._show_cache.get(key)
@@ -752,7 +829,9 @@ class StoryHallCog(commands.Cog, name="StoryHallCog"):
                 "media": "podcast",
                 "entity": "podcast",
                 "term": query,
-                "limit": limit,
+                "limit": max(limit * 4, 24),
+                "country": "RU",
+                "lang": "ru_ru",
             }
         )
         try:
@@ -764,14 +843,14 @@ class StoryHallCog(commands.Cog, name="StoryHallCog"):
             log.exception("story hall show search crashed query=%r: %s", query, exc)
             raise CatalogUnavailableError(CATALOG_UNAVAILABLE_TEXT) from exc
 
-        shows: list[StoryShow] = []
+        raw_shows: list[StoryShow] = []
         seen: set[str] = set()
         for item in data.get("results") or []:
             feed_url = str(item.get("feedUrl") or "").strip()
             if not feed_url or feed_url in seen:
                 continue
             seen.add(feed_url)
-            shows.append(
+            raw_shows.append(
                 StoryShow(
                     title=str(item.get("collectionName") or item.get("trackName") or "Безымянное шоу"),
                     author=str(item.get("artistName") or ""),
@@ -780,11 +859,12 @@ class StoryHallCog(commands.Cog, name="StoryHallCog"):
                     webpage_url=str(item.get("collectionViewUrl") or item.get("trackViewUrl") or ""),
                 )
             )
-            if len(shows) >= limit:
+            if len(raw_shows) >= max(limit * 4, 24):
                 break
 
+        shows = await self._filter_russian_shows(raw_shows, limit=limit)
         self._show_cache[key] = (now + SEARCH_CACHE_TTL, shows)
-        log.info("story hall show search query=%r results=%d", query, len(shows))
+        log.info("story hall show search query=%r raw=%d russian=%d", query, len(raw_shows), len(shows))
         return list(shows)
 
     async def _episodes_for_show(
@@ -802,6 +882,10 @@ class StoryHallCog(commands.Cog, name="StoryHallCog"):
             return list(cached[1])
 
         try:
+            is_russian = await asyncio.to_thread(self._feed_is_russian_sync, show.feed_url)
+            if not is_russian:
+                self._feed_cache[key] = (now + FEED_CACHE_TTL, [])
+                return []
             episodes = await asyncio.to_thread(
                 self._parse_feed_sync,
                 show.feed_url,
@@ -1040,7 +1124,7 @@ class StoryHallCog(commands.Cog, name="StoryHallCog"):
             require_active_session=False,
             require_voice_if_inactive=False,
         )
-        if not ok and conflict_text_for_request(self.bot, PLAYBACK_MODE_STORIES):
+        if not ok:
             await safe_send(interaction, text, ephemeral=True)
             return
         view = CollectionView(self)
@@ -1052,10 +1136,496 @@ class StoryHallCog(commands.Cog, name="StoryHallCog"):
             require_active_session=False,
             require_voice_if_inactive=False,
         )
-        if not ok and conflict_text_for_request(self.bot, PLAYBACK_MODE_STORIES):
+        if not ok:
             await safe_send(interaction, text, ephemeral=True)
             return
         try:
             await interaction.response.send_modal(StorySearchModal(self))
         except Exception:
             await safe_send(interaction, "Не удалось открыть поиск шоу.", ephemeral=True)
+
+    async def handle_show_search_submit(self, interaction: discord.Interaction, query: str) -> None:
+        await safe_defer_ephemeral(interaction)
+        raw_query = str(query or "").strip()
+        if not raw_query:
+            await safe_send(interaction, "Название шоу пустое.", ephemeral=True)
+            return
+        await safe_send(interaction, SEARCH_PROGRESS_TEXT, ephemeral=True)
+        try:
+            shows = await self._search_shows(raw_query, limit=SHOW_SEARCH_LIMIT)
+        except CatalogUnavailableError as exc:
+            await safe_send(interaction, str(exc), ephemeral=True)
+            return
+        if not shows:
+            await safe_send(interaction, "Зал не нашел подходящих русскоязычных шоу по этому имени.", ephemeral=True)
+            return
+        view = ShowResultsView(
+            self,
+            shows,
+            title="Результаты поиска",
+            description="Выбери шоу, чтобы раскрыть его выпуски.",
+        )
+        await safe_send(interaction, embed=view.build_embed(), view=view, ephemeral=True)
+
+    async def open_category_shows(self, interaction: discord.Interaction, category_key: str) -> None:
+        category = CATEGORY_DEFS.get(category_key)
+        if not category:
+            await safe_send(interaction, "Эта подборка недоступна.", ephemeral=True)
+            return
+        loading = discord.Embed(
+            title=f"Подборка: {category['label']}",
+            description=COLLECTION_PROGRESS_TEXT,
+            color=discord.Color.dark_teal(),
+        )
+        await safe_edit_message(interaction, embed=loading, view=None)
+        try:
+            shows = await self._search_shows_for_category(category_key, limit=SHOW_SEARCH_LIMIT)
+        except CatalogUnavailableError as exc:
+            await safe_edit_message(
+                interaction,
+                embed=discord.Embed(
+                    title=f"Подборка: {category['label']}",
+                    description=str(exc),
+                    color=discord.Color.dark_teal(),
+                ),
+                view=None,
+            )
+            return
+        if not shows:
+            await safe_edit_message(
+                interaction,
+                embed=discord.Embed(
+                    title=f"Подборка: {category['label']}",
+                    description="Зал пока не нашел подходящих шоу в этой подборке.",
+                    color=discord.Color.dark_teal(),
+                ),
+                view=None,
+            )
+            return
+        view = ShowResultsView(
+            self,
+            shows,
+            title=f"Подборка: {category['label']}",
+            description="Выбери шоу, чтобы раскрыть его выпуски.",
+            category_key=category_key,
+            category_label=str(category["label"]),
+        )
+        await safe_edit_message(interaction, embed=view.build_embed(), view=view)
+
+    async def open_show_episodes(
+        self,
+        interaction: discord.Interaction,
+        show: StoryShow,
+        *,
+        category_key: str,
+        category_label: str,
+    ) -> None:
+        if not category_label:
+            category_label = "Поиск шоу"
+        if not category_key:
+            category_key = "search"
+        loading = discord.Embed(
+            title=show.title,
+            description="Зал раскрывает ленту шоу и собирает доступные выпуски.",
+            color=discord.Color.dark_teal(),
+        )
+        await safe_edit_message(interaction, embed=loading, view=None)
+        try:
+            episodes = await self._episodes_for_show(
+                show,
+                category_key=category_key,
+                category_label=category_label,
+                limit=EPISODE_LIST_LIMIT,
+            )
+        except CatalogUnavailableError as exc:
+            await safe_edit_message(
+                interaction,
+                embed=discord.Embed(
+                    title=show.title,
+                    description=str(exc),
+                    color=discord.Color.dark_teal(),
+                ),
+                view=None,
+            )
+            return
+        if not episodes:
+            await safe_edit_message(
+                interaction,
+                embed=discord.Embed(
+                    title=show.title,
+                    description="У этого шоу сейчас не открылось ни одного доступного выпуска.",
+                    color=discord.Color.dark_teal(),
+                ),
+                view=None,
+            )
+            return
+        view = EpisodeResultsView(self, show, episodes)
+        await safe_edit_message(interaction, embed=view.build_embed(), view=view)
+
+    async def play_random_story(self, interaction: discord.Interaction) -> None:
+        await safe_defer_ephemeral(interaction)
+        ok, member, text = await self._voice_access_check(interaction, require_active_session=False, require_voice_if_inactive=True)
+        if not ok or member is None:
+            await safe_send(interaction, text, ephemeral=True)
+            return
+        await safe_send(interaction, RANDOM_STORY_PROGRESS_TEXT, ephemeral=True)
+        try:
+            episode = await self._pick_random_episode_from_group(RANDOM_STORY_KEYS)
+        except CatalogUnavailableError as exc:
+            await safe_send(interaction, str(exc), ephemeral=True)
+            return
+        if episode is None:
+            await safe_send(interaction, NO_RANDOM_TEXT, ephemeral=True)
+            return
+        await self._start_episode(interaction, member, episode, announce=True)
+
+    async def play_random_podcast(self, interaction: discord.Interaction) -> None:
+        await safe_defer_ephemeral(interaction)
+        ok, member, text = await self._voice_access_check(interaction, require_active_session=False, require_voice_if_inactive=True)
+        if not ok or member is None:
+            await safe_send(interaction, text, ephemeral=True)
+            return
+        await safe_send(interaction, RANDOM_PODCAST_PROGRESS_TEXT, ephemeral=True)
+        try:
+            episode = await self._pick_random_episode_from_group(RANDOM_PODCAST_KEYS)
+        except CatalogUnavailableError as exc:
+            await safe_send(interaction, str(exc), ephemeral=True)
+            return
+        if episode is None:
+            await safe_send(interaction, NO_RANDOM_TEXT, ephemeral=True)
+            return
+        await self._start_episode(interaction, member, episode, announce=True)
+
+    async def resume_last_episode(self, interaction: discord.Interaction) -> None:
+        await safe_defer_ephemeral(interaction)
+        ok, member, text = await self._voice_access_check(interaction, require_active_session=False, require_voice_if_inactive=True)
+        if not ok or member is None:
+            await safe_send(interaction, text, ephemeral=True)
+            return
+        repo = self._repo()
+        if not repo:
+            await safe_send(interaction, "Хранилище историй сейчас недоступно.", ephemeral=True)
+            return
+        resume = await repo.get_story_audio_resume(member.id)
+        if not resume:
+            await safe_send(interaction, NO_RESUME_TEXT, ephemeral=True)
+            return
+        episode = StoryEpisode(
+            title=str(resume.get("episode_title") or "Безымянный выпуск"),
+            show_title=str(resume.get("show_title") or "Безымянное шоу"),
+            audio_url=str(resume.get("audio_url") or ""),
+            webpage_url=str(resume.get("webpage_url") or ""),
+            artwork_url=str(resume.get("artwork_url") or ""),
+            duration_sec=int(resume.get("duration_sec") or 0),
+            guid=str(resume.get("episode_guid") or ""),
+            feed_url=str(resume.get("feed_url") or ""),
+            category_key="resume",
+            category_label=str(resume.get("category") or "Продолжение"),
+        )
+        if not episode.audio_url:
+            await repo.clear_story_audio_resume(member.id)
+            await safe_send(interaction, NO_RESUME_TEXT, ephemeral=True)
+            return
+        await self._start_episode(
+            interaction,
+            member,
+            episode,
+            resume_from_sec=int(resume.get("resume_position_sec") or 0),
+            announce=True,
+        )
+
+    async def start_episode_from_choice(self, interaction: discord.Interaction, episode: StoryEpisode) -> None:
+        ok, member, text = await self._voice_access_check(interaction, require_active_session=False, require_voice_if_inactive=True)
+        if not ok or member is None:
+            await safe_send(interaction, text, ephemeral=True)
+            return
+        await self._start_episode(interaction, member, episode, announce=True)
+
+    def _build_resume_payload_locked(self, session: StorySession) -> Optional[dict[str, Any]]:
+        episode = session.current_episode
+        if episode is None:
+            return None
+        position = int(session.resume_position_sec or 0)
+        if session.play_started_monotonic > 0:
+            position += max(0, int(time.monotonic() - session.play_started_monotonic))
+        if episode.duration_sec > 0 and position >= max(episode.duration_sec - 15, 0):
+            return None
+        return {
+            "user_id": int(session.started_by_user_id),
+            "show_title": episode.show_title,
+            "episode_title": episode.title,
+            "category": episode.category_label,
+            "audio_url": episode.audio_url,
+            "webpage_url": episode.webpage_url,
+            "artwork_url": episode.artwork_url,
+            "feed_url": episode.feed_url,
+            "episode_guid": episode.guid,
+            "duration_sec": int(episode.duration_sec or 0),
+            "resume_position_sec": int(position),
+        }
+
+    async def _persist_resume_payload(self, payload: Optional[dict[str, Any]]) -> None:
+        if not payload:
+            return
+        repo = self._repo()
+        if not repo:
+            return
+        try:
+            await repo.set_story_audio_resume(**payload)
+        except Exception:
+            log.exception("story hall failed to persist resume payload")
+
+    async def _start_episode(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        episode: StoryEpisode,
+        *,
+        resume_from_sec: int = 0,
+        announce: bool = False,
+    ) -> None:
+        await self._ensure_voice_connection(member)
+        repo = self._repo()
+        created_session = False
+        try:
+            async with self._lock:
+                if self.session is None:
+                    conflict_text = conflict_text_for_request(self.bot, PLAYBACK_MODE_STORIES)
+                    if conflict_text:
+                        raise RuntimeError(conflict_text)
+                elif not self._same_active_voice(member):
+                    raise RuntimeError("История уже звучит в другом зале. Приди туда, где сейчас говорит Алтарь.")
+                if self.session is None:
+                    self.session = StorySession(
+                        guild_id=member.guild.id,
+                        text_channel_id=self._altar_channel_id(),
+                        voice_channel_id=int(member.voice.channel.id),  # type: ignore[union-attr]
+                        started_by_user_id=member.id,
+                    )
+                    created_session = True
+                session = self.session
+                assert session is not None
+                session.guild_id = member.guild.id
+                session.text_channel_id = self._altar_channel_id()
+                session.voice_channel_id = int(member.voice.channel.id)  # type: ignore[union-attr]
+                session.started_by_user_id = member.id
+                session.state = "playing"
+                session.idle_disconnect_at = 0
+                session.resume_position_sec = max(0, int(resume_from_sec or 0))
+                session.current_episode = episode
+                session.suppress_after_until = time.monotonic() + 1.0
+                self._last_panel_state = "playing"
+                vc = self._voice_client()
+                if vc and vc.is_connected() and (vc.is_playing() or vc.is_paused()):
+                    try:
+                        vc.stop()
+                    except Exception:
+                        pass
+                await self._play_episode_locked()
+        except Exception as exc:
+            async with self._lock:
+                if self.session is not None:
+                    self.session.current_episode = None
+                    self.session.resume_position_sec = 0
+                    self.session.play_started_monotonic = 0.0
+                    self.session.state = "idle"
+                if created_session:
+                    self.session = None
+                    self._last_panel_state = "silent"
+            await self._update_panel_message()
+            await safe_send(interaction, f"Не удалось запустить выпуск: {exc}", ephemeral=True)
+            return
+
+        if repo:
+            try:
+                await repo.clear_story_audio_resume(member.id)
+            except Exception:
+                log.exception("story hall failed to clear previous resume")
+        self._remember_recent_episode(episode)
+        await self._update_panel_message()
+        if announce:
+            extra = ""
+            if resume_from_sec > 0:
+                extra = f" Продолжено с **{_fmt_duration(resume_from_sec)}**."
+            await safe_send(
+                interaction,
+                EPISODE_START_TEXT.format(title=episode.title) + extra,
+                ephemeral=True,
+            )
+
+    async def _play_episode_locked(self) -> None:
+        session = self.session
+        vc = self._voice_client()
+        if session is None or session.current_episode is None or vc is None or not vc.is_connected():
+            return
+        if not self._ffmpeg:
+            raise RuntimeError("ffmpeg не найден")
+
+        before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+        if session.resume_position_sec > 0:
+            before = f"-ss {int(session.resume_position_sec)} " + before
+
+        source = discord.FFmpegPCMAudio(
+            session.current_episode.audio_url,
+            executable=self._ffmpeg,
+            before_options=before,
+            options="-vn",
+        )
+        session.state = "playing"
+        session.play_started_monotonic = time.monotonic()
+        self._last_panel_state = "playing"
+
+        def _after_playback(error: Optional[Exception]) -> None:
+            loop = self.bot.loop
+            loop.call_soon_threadsafe(asyncio.create_task, self._after_episode_finished(error))
+
+        vc.play(source, after=_after_playback)
+
+    async def _after_episode_finished(self, error: Optional[Exception]) -> None:
+        if error:
+            log.warning("story hall playback after-callback error: %s", error)
+
+        clear_user_id = 0
+        async with self._lock:
+            session = self.session
+            if session is None:
+                return
+            if time.monotonic() < float(session.suppress_after_until or 0.0):
+                return
+            clear_user_id = int(session.started_by_user_id or 0)
+            session.current_episode = None
+            session.resume_position_sec = 0
+            session.play_started_monotonic = 0.0
+            session.state = "ended"
+            session.idle_disconnect_at = _now() + IDLE_DISCONNECT_SECONDS
+            self._last_panel_state = "ended"
+        repo = self._repo()
+        if repo and clear_user_id:
+            try:
+                await repo.clear_story_audio_resume(clear_user_id)
+            except Exception:
+                log.exception("story hall failed to clear finished resume")
+        await self._update_panel_message()
+
+    async def stop(self, interaction: discord.Interaction) -> None:
+        await safe_defer_update(interaction)
+        ok, _, text = await self._voice_access_check(interaction, require_active_session=True)
+        if not ok:
+            await safe_send(interaction, text, ephemeral=True)
+            return
+        payload: Optional[dict[str, Any]]
+        async with self._lock:
+            payload = await self._close_session_locked(state="stopped", save_resume=True)
+        await self._persist_resume_payload(payload)
+        await self._update_panel_message()
+        await safe_send(interaction, STOP_TEXT, ephemeral=True)
+
+    async def _close_session_locked(self, *, state: str, save_resume: bool) -> Optional[dict[str, Any]]:
+        session = self.session
+        vc = self._voice_client()
+        payload = self._build_resume_payload_locked(session) if session and save_resume else None
+        if session is not None:
+            session.suppress_after_until = time.monotonic() + 1.0
+            session.current_episode = None
+            session.resume_position_sec = 0
+            session.play_started_monotonic = 0.0
+            session.idle_disconnect_at = 0
+            session.state = state
+        self._last_panel_state = state
+        if vc and vc.is_connected():
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+        self.session = None
+        return payload
+
+    async def _update_idle_deadline(self) -> None:
+        session = self.session
+        if session is None:
+            return
+        vc = self._voice_client()
+        if not vc or not vc.is_connected():
+            return
+        listeners = self._non_bot_listeners()
+        if listeners:
+            if session.idle_disconnect_at != 0 and session.current_episode is not None:
+                session.idle_disconnect_at = 0
+                await self._update_panel_message()
+            return
+        if session.idle_disconnect_at == 0:
+            session.idle_disconnect_at = _now() + IDLE_DISCONNECT_SECONDS
+            await self._update_panel_message()
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if self.session is None:
+            return
+        if int(member.guild.id) != int(self.session.guild_id):
+            return
+        tracked_id = int(self.session.voice_channel_id)
+        before_id = int(before.channel.id) if before.channel else 0
+        after_id = int(after.channel.id) if after.channel else 0
+        if tracked_id not in {before_id, after_id}:
+            return
+
+        if self.bot.user and member.id == self.bot.user.id and after.channel is None:
+            payload: Optional[dict[str, Any]]
+            async with self._lock:
+                payload = self._build_resume_payload_locked(self.session) if self.session else None
+                self.session = None
+                self._last_panel_state = "silent"
+            await self._persist_resume_payload(payload)
+            await self._update_panel_message()
+            return
+
+        await self._update_idle_deadline()
+
+    @tasks.loop(seconds=10)
+    async def panel_watcher(self) -> None:
+        if not self.bot.is_ready():
+            return
+        if self.session is None:
+            return
+        payload: Optional[dict[str, Any]] = None
+        async with self._lock:
+            session = self.session
+            if session is None:
+                return
+            if session.idle_disconnect_at and _now() >= int(session.idle_disconnect_at):
+                payload = await self._close_session_locked(state="silent", save_resume=True)
+        if payload is not None:
+            await self._persist_resume_payload(payload)
+        await self._update_panel_message()
+
+    @panel_watcher.before_loop
+    async def panel_watcher_before_loop(self) -> None:
+        await self.bot.wait_until_ready()
+
+    @commands.command(name="post_story_hall_panel")
+    async def post_story_hall_panel(self, ctx: commands.Context) -> None:
+        if not self._is_admin(ctx.author.id):
+            return
+        msg = await self.ensure_panel_message()
+        if not msg:
+            await ctx.reply("Не удалось найти канал Зала историй.")
+            return
+        await self._update_panel_message()
+        await ctx.reply(f"Панель Зала историй готова: канал <#{self._altar_channel_id()}>.")
+
+
+def get_persistent_views(bot: commands.Bot) -> list[discord.ui.View]:
+    return [StoryHallView(bot)]
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(StoryHallCog(bot))

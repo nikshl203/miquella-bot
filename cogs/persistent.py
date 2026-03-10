@@ -30,6 +30,7 @@ def _collect_views(bot: commands.Bot) -> List[discord.ui.View]:
         "cogs.void_info",
         "cogs.echo_posts",
         "cogs.story",
+        "cogs.story_hall",
         "cogs.tendril",
         "cogs.orders",
         "cogs.music",
